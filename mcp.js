@@ -37,35 +37,83 @@ async function payInvoice(invoice) {
     throw new Error("Payment timed out.");
 }
 
-// ── 1. Register a single, dead-simple tool ──
+// ── 1. Register tools ──
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [{
-        name: "fetch_with_l402",
-        description: [
-            "Fetches data from any URL that may require Lightning payment.",
-            "If the server returns HTTP 402 Payment Required, this tool automatically:",
-            "  1. Extracts the Lightning invoice from the response",
-            "  2. Pays the invoice using the configured wallet",
-            "  3. Obtains the payment preimage (proof of payment)",
-            "  4. Retries the request with the L402 Authorization header",
-            "  5. Returns the final data",
-            "",
-            "Just pass a URL — the tool handles everything."
-        ].join("\n"),
-        inputSchema: {
-            type: "object",
-            properties: {
-                url:    { type: "string", description: "The URL to fetch (e.g. http://localhost:3000/api/data)" },
-                method: { type: "string", description: "HTTP method (default: GET)", enum: ["GET", "POST", "PUT", "DELETE"] },
-                body:   { type: "string", description: "Optional JSON body for POST/PUT requests" }
-            },
-            required: ["url"]
+    tools: [
+        {
+            name: "pay_lightning_invoice",
+            description: "Pays a Lightning Network BOLT11 invoice and retrieves the L402 preimage receipt. Returns the verified preimage and the exact Authorization header format to retry the request.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    invoice: { type: "string", description: "The lntb... or lnbc... invoice string" },
+                    serverUrl: { type: "string", description: "Optional API server URL (default: http://localhost:3000)" }
+                },
+                required: ["invoice"]
+            }
+        },
+        {
+            name: "fetch_with_l402",
+            description: [
+                "Fetches data from any URL that may require Lightning payment.",
+                "If the server returns HTTP 402 Payment Required, this tool automatically:",
+                "  1. Extracts the Lightning invoice from the response",
+                "  2. Pays the invoice using the configured wallet",
+                "  3. Obtains the payment preimage (proof of payment)",
+                "  4. Retries the request with the L402 Authorization header",
+                "  5. Returns the final data",
+                "",
+                "Just pass a URL — the tool handles everything."
+            ].join("\n"),
+            inputSchema: {
+                type: "object",
+                properties: {
+                    url:    { type: "string", description: "The URL to fetch (e.g. http://localhost:3000/api/data)" },
+                    method: { type: "string", description: "HTTP method (default: GET)", enum: ["GET", "POST", "PUT", "DELETE"] },
+                    body:   { type: "string", description: "Optional JSON body for POST/PUT requests" }
+                },
+                required: ["url"]
+            }
         }
-    }]
+    ]
 }));
 
-// ── 2. Execute the full L402 handshake in one shot ──
+// ── 2. Tool Handlers ──
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    if (request.params.name === "pay_lightning_invoice") {
+        const { invoice, serverUrl = "http://localhost:3000" } = request.params.arguments || {};
+        if (!invoice) return fail("Missing required 'invoice' parameter.");
+        try {
+            await payInvoice(invoice);
+
+            // Fetch the verified preimage from the server
+            let preimage;
+            for (let i = 0; i < 15; i++) {
+                try {
+                    const { data } = await axios.get(`${serverUrl}/api/preimage/${encodeURIComponent(invoice)}`);
+                    if (data?.preimage) {
+                        preimage = data.preimage;
+                        break;
+                    }
+                } catch (e) {
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+            }
+
+            if (preimage) {
+                return ok(
+                    `✅ Successfully paid Lightning invoice!\n\n` +
+                    `Preimage: ${preimage}\n\n` +
+                    `Now retry your request with this header:\n` +
+                    `Authorization: L402 <macaroon>:${preimage}`
+                );
+            }
+            return ok(`Successfully paid Lightning invoice! Invoice: ${invoice.slice(0, 30)}...`);
+        } catch (err) {
+            return fail(`Payment failed: ${err.message}`);
+        }
+    }
+
     if (request.params.name !== "fetch_with_l402") {
         throw new Error("Unknown tool: " + request.params.name);
     }
@@ -75,8 +123,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
         // ── First request ──
         let response;
+        const requestData = body ? (typeof body === 'string' ? JSON.parse(body) : body) : undefined;
         try {
-            response = await axios({ method, url, data: body ? JSON.parse(body) : undefined });
+            response = await axios({ method, url, data: requestData });
         } catch (err) {
             if (!err.response || err.response.status !== 402) throw err;
             response = err.response;
@@ -126,7 +175,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // ── Retry the original request with L402 credentials ──
         const retryResponse = await axios({
             method, url,
-            data: body ? JSON.parse(body) : undefined,
+            data: requestData,
             headers: { 'Authorization': `L402 ${macaroon}:${preimage}` }
         });
 

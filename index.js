@@ -11,8 +11,12 @@ const MACAROON_SECRET = "super-secret-hackathon-key";
 const VOLTAGE_BASE = `https://voltageapi.com/v1/organizations/${process.env.VOLTAGE_ORG_ID}/environments/${process.env.VOLTAGE_ENV_ID}/payments`;
 const VOLTAGE_HEADERS = { 'x-api-key': process.env.VOLTAGE_API_KEY, 'Content-Type': 'application/json' };
 
-// ── In-memory store: paymentHash → { preimage, invoice, paid } ──
+// ── In-memory stores ──
+// paymentHash → { preimage, invoice, paid, createdAt }
 const challenges = new Map();
+// clientKey (IP) → { paymentHash, expiresAt }
+const clientActiveChallenge = new Map();
+const CHALLENGE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 // ── Helper: Create a Voltage invoice ──
 async function createInvoice(amountSats) {
@@ -53,22 +57,39 @@ async function isInvoicePaid(invoice) {
 app.get('/api/data', async (req, res) => {
     const authHeader = req.headers.authorization;
 
-    // ── No token → issue a 402 challenge ──
+    // ── No token → issue (or re-issue active) 402 challenge ──
     if (!authHeader || !authHeader.startsWith('L402 ')) {
         try {
-            // 1. Generate a random 32-byte preimage (the secret)
+            const clientIp = req.ip || req.socket.remoteAddress || 'unknown-client';
+            const now = Date.now();
+
+            // 1. Check if client already has an active, unpaid challenge within TTL
+            const active = clientActiveChallenge.get(clientIp);
+            if (active && active.expiresAt > now) {
+                const existing = challenges.get(active.paymentHash);
+                if (existing && !existing.paid) {
+                    const mac = macaroons.MacaroonsBuilder.create("tollgate.local", MACAROON_SECRET, active.paymentHash);
+                    console.log(`[402] Re-using active challenge for ${clientIp} hash=${active.paymentHash.slice(0, 16)}…`);
+                    return res.status(402)
+                        .header('WWW-Authenticate', `L402 macaroon="${mac.serialize()}", invoice="${existing.invoice}"`)
+                        .json({ error: "Payment Required to access API", message: "Existing active invoice returned." });
+                }
+            }
+
+            // 2. Generate a random 32-byte preimage (the secret)
             const preimage = crypto.randomBytes(32).toString('hex');
-            // 2. paymentHash = SHA256(preimage)  — this is what the L402 spec requires
+            // 3. paymentHash = SHA256(preimage)  — this is what the L402 spec requires
             const paymentHash = crypto.createHash('sha256').update(Buffer.from(preimage, 'hex')).digest('hex');
-            // 3. Create a Voltage invoice so the client can pay
+            // 4. Create a Voltage invoice so the client can pay
             const { invoice } = await createInvoice(10);
-            // 4. Build a macaroon whose identifier IS the paymentHash
+            // 5. Build a macaroon whose identifier IS the paymentHash
             const mac = macaroons.MacaroonsBuilder.create("tollgate.local", MACAROON_SECRET, paymentHash);
 
-            // 5. Store everything so we can hand back the preimage after payment
-            challenges.set(paymentHash, { preimage, invoice, paid: false });
+            // 6. Store everything so we can hand back the preimage after payment & cache for client
+            challenges.set(paymentHash, { preimage, invoice, paid: false, createdAt: now });
+            clientActiveChallenge.set(clientIp, { paymentHash, expiresAt: now + CHALLENGE_TTL_MS });
 
-            console.log(`[402] Challenge issued  hash=${paymentHash.slice(0, 16)}…`);
+            console.log(`[402] New challenge issued for ${clientIp} hash=${paymentHash.slice(0, 16)}…`);
 
             return res.status(402)
                 .header('WWW-Authenticate', `L402 macaroon="${mac.serialize()}", invoice="${invoice}"`)
@@ -97,6 +118,12 @@ app.get('/api/data', async (req, res) => {
         }
 
         console.log(`[200] Payment verified!  hash=${expectedHash.slice(0, 16)}…`);
+        const clientIp = req.ip || req.socket.remoteAddress || 'unknown-client';
+        const active = clientActiveChallenge.get(clientIp);
+        if (active && active.paymentHash === expectedHash) {
+            clientActiveChallenge.delete(clientIp);
+        }
+
         return res.json({
             success: true,
             message: "Tollgate paywall bypassed successfully using Machine Money!",
@@ -111,10 +138,23 @@ app.get('/api/data', async (req, res) => {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // PREIMAGE ENDPOINT — the client calls this AFTER paying the invoice
 // Returns the preimage only if the invoice has actually been settled.
+// Accepts either paymentHash OR the full invoice string.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-app.get('/api/preimage/:paymentHash', async (req, res) => {
-    const challenge = challenges.get(req.params.paymentHash);
-    if (!challenge) return res.status(404).json({ error: "Unknown payment hash." });
+app.get('/api/preimage/:identifier', async (req, res) => {
+    const identifier = req.params.identifier;
+    let challenge = challenges.get(identifier);
+
+    // If not found by paymentHash, look up by invoice string
+    if (!challenge) {
+        for (const [hash, c] of challenges.entries()) {
+            if (c.invoice === identifier) {
+                challenge = c;
+                break;
+            }
+        }
+    }
+
+    if (!challenge) return res.status(404).json({ error: "Unknown payment hash or invoice." });
 
     // Check Voltage to confirm the invoice was really paid
     if (!challenge.paid) {
