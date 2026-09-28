@@ -83,6 +83,11 @@ app.get('/', (req, res) => {
     });
 });
 
+// Active challenges map to avoid generating duplicate invoices when the same client retries/probes
+// clientKey -> { invoice, paymentHash, paymentId, macaroon, createdAt, settled }
+const activeChallenges = new Map();
+const CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // MERCHANT PAYWALLED RESOURCE: GET /api/data
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -92,19 +97,50 @@ app.get('/api/data', async (req, res) => {
     // Case 1: Unauthenticated request -> Issue HTTP 402 Payment Required
     if (!authHeader || !authHeader.startsWith('L402 ')) {
         try {
-            console.log(`[MERCHANT :${PORT}] Incoming unauthenticated request -> Creating 10 sat invoice on Receiver Wallet (${RECEIVER_WALLET_ID})...`);
-            const { invoice, paymentHash } = await createMerchantInvoice(10);
-            const mac = macaroons.MacaroonsBuilder.create("merchant.local", MACAROON_SECRET, paymentHash);
+            const clientKey = `${req.ip || 'client'}:${req.originalUrl || req.path}`;
+            const existing = activeChallenges.get(clientKey);
 
-            console.log(`[MERCHANT :${PORT}] 402 Challenge Issued (Payment Hash: ${paymentHash.slice(0, 16)}...)`);
+            let invoice, paymentHash, paymentId, serializedMac;
+
+            // If an active unsettled invoice was generated for this client within 5 mins, reuse it!
+            if (existing && !existing.settled && (Date.now() - existing.createdAt < CHALLENGE_TTL_MS)) {
+                invoice = existing.invoice;
+                paymentHash = existing.paymentHash;
+                paymentId = existing.paymentId;
+                serializedMac = existing.macaroon;
+                console.log(`[MERCHANT :${PORT}] Reusing active pending invoice for ${clientKey} (Payment Hash: ${paymentHash.slice(0, 16)}...)`);
+            } else {
+                console.log(`[MERCHANT :${PORT}] Incoming unauthenticated request -> Creating 10 sat invoice on Receiver Wallet (${RECEIVER_WALLET_ID})...`);
+                const created = await createMerchantInvoice(10);
+                invoice = created.invoice;
+                paymentHash = created.paymentHash;
+                paymentId = created.paymentId;
+
+                const mac = macaroons.MacaroonsBuilder.create("merchant.local", MACAROON_SECRET, paymentHash);
+                serializedMac = mac.serialize();
+
+                activeChallenges.set(clientKey, {
+                    invoice,
+                    paymentHash,
+                    paymentId,
+                    macaroon: serializedMac,
+                    createdAt: Date.now(),
+                    settled: false
+                });
+
+                console.log(`[MERCHANT :${PORT}] 402 Challenge Issued (Payment Hash: ${paymentHash.slice(0, 16)}...)`);
+            }
 
             return res.status(402)
-                .header('WWW-Authenticate', `L402 macaroon="${mac.serialize()}", invoice="${invoice}"`)
+                .header('WWW-Authenticate', `L402 macaroon="${serializedMac}", invoice="${invoice}"`)
                 .json({ 
                     error: "Payment Required",
                     priceSats: 10,
                     receiverWallet: RECEIVER_WALLET_ID,
-                    instruction: "Pay the BOLT11 invoice and return Authorization: L402 <macaroon>:<preimage>"
+                    invoice: invoice,
+                    macaroon: serializedMac,
+                    paymentHash: paymentHash,
+                    instruction: "Pay this BOLT11 invoice using 'pay_lightning_invoice' or pass { url, invoice, macaroon } to 'fetch_with_l402' to unlock."
                 });
         } catch (err) {
             console.error(`[MERCHANT :${PORT}] Failed to generate invoice:`, err.response?.data || err.message);
@@ -169,6 +205,14 @@ app.get('/api/data', async (req, res) => {
         }
 
         console.log(`[MERCHANT :${PORT}] ✅ L402 Verified! Payment confirmed for hash ${expectedHash.slice(0, 16)}...`);
+
+        // Mark challenge settled and clear from activeChallenges so subsequent requests get a fresh invoice
+        for (const [key, ch] of activeChallenges.entries()) {
+            if (ch.paymentHash === expectedHash) {
+                ch.settled = true;
+                activeChallenges.delete(key);
+            }
+        }
 
         return res.json({
             success: true,

@@ -92,22 +92,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         {
             name: "fetch_with_l402",
             description: [
-                "Fetches data from any URL that may require Lightning payment.",
-                "If the server returns HTTP 402 Payment Required, this tool automatically:",
-                "  1. Extracts the Lightning invoice from the response",
-                "  2. Pays the invoice using the configured wallet",
-                "  3. Obtains the payment preimage directly from the payment response",
-                "  4. Retries the request with the L402 Authorization header",
-                "  5. Returns the final data",
-                "",
-                "Just pass a URL — the tool handles everything."
+                "Fetches data from any URL requiring Lightning L402 payment.",
+                "Can pay an existing invoice from a prior 402 challenge, or automatically discover, pay, and unlock.",
+                "Options:",
+                "  1. Just pass 'url': tool discovers 402, pays invoice, and unlocks data.",
+                "  2. Pass 'url', 'invoice', and 'macaroon': pays existing invoice without duplicate requests.",
+                "  3. Pass 'url', 'macaroon', and 'preimage': unlocks immediately if invoice was already paid."
             ].join("\n"),
             inputSchema: {
                 type: "object",
                 properties: {
-                    url:    { type: "string", description: "The URL to fetch (e.g. http://localhost:3000/api/data)" },
-                    method: { type: "string", description: "HTTP method (default: GET)", enum: ["GET", "POST", "PUT", "DELETE"] },
-                    body:   { type: "string", description: "Optional JSON body for POST/PUT requests" }
+                    url:      { type: "string", description: "The paywalled URL to access (e.g. http://localhost:3001/api/data)" },
+                    method:   { type: "string", description: "HTTP method (default: GET)", enum: ["GET", "POST", "PUT", "DELETE"] },
+                    body:     { type: "string", description: "Optional JSON body for POST/PUT requests" },
+                    invoice:  { type: "string", description: "Optional BOLT11 invoice if already received from a prior 402 challenge" },
+                    macaroon: { type: "string", description: "Optional L402 macaroon if already received from a prior 402 challenge" },
+                    preimage: { type: "string", description: "Optional payment preimage if invoice was already paid via pay_lightning_invoice" }
                 },
                 required: ["url"]
             }
@@ -128,7 +128,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     `✅ Successfully paid Lightning invoice!\n\n` +
                     `Preimage: ${preimage}\n\n` +
                     `Now retry your request with this header:\n` +
-                    `Authorization: L402 <macaroon>:${preimage}`
+                    `Authorization: L402 <macaroon>:${preimage}\n` +
+                    `Or call fetch_with_l402 with { url, macaroon, preimage: "${preimage}" }`
                 );
             }
             return ok(`Successfully paid Lightning invoice! Invoice: ${invoice.slice(0, 30)}...`);
@@ -141,37 +142,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error("Unknown tool: " + request.params.name);
     }
 
-    const { url, method = "GET", body } = request.params.arguments;
+    const { url, method = "GET", body, invoice: inputInvoice, macaroon: inputMacaroon, preimage: inputPreimage } = request.params.arguments || {};
 
     try {
-        // ── First request ──
-        let response;
+        let invoice = inputInvoice;
+        let macaroon = inputMacaroon;
+        let preimage = inputPreimage;
         const requestData = body ? (typeof body === 'string' ? JSON.parse(body) : body) : undefined;
-        try {
-            response = await axios({ method, url, data: requestData });
-        } catch (err) {
-            if (!err.response || err.response.status !== 402) throw err;
-            response = err.response;
+
+        // Step 1: Settle invoice if preimage not already provided
+        if (!preimage) {
+            // If invoice or macaroon were not passed, probe the URL to get the 402 challenge
+            if (!invoice || !macaroon) {
+                let response;
+                try {
+                    response = await axios({ method, url, data: requestData });
+                } catch (err) {
+                    if (!err.response || err.response.status !== 402) throw err;
+                    response = err.response;
+                }
+
+                if (response.status !== 402) {
+                    return ok(`Status ${response.status}\n\n${JSON.stringify(response.data, null, 2)}`);
+                }
+
+                const wwwAuth = response.headers['www-authenticate'] || '';
+                macaroon = macaroon || wwwAuth.match(/macaroon="([^"]+)"/)?.[1] || response.data?.macaroon;
+                invoice = invoice || wwwAuth.match(/invoice="([^"]+)"/)?.[1] || response.data?.invoice;
+                if (!macaroon || !invoice) {
+                    return fail("Got 402 but could not parse macaroon or invoice from WWW-Authenticate or response body.");
+                }
+            }
+
+            preimage = await payInvoice(invoice);
+            if (!preimage) return fail("Payment completed but no preimage was returned.");
         }
 
-        // If it's not a 402, just return the data directly
-        if (response.status !== 402) {
-            return ok(`Status ${response.status}\n\n${JSON.stringify(response.data, null, 2)}`);
-        }
-
-        // ── Parse the L402 challenge ──
-        const wwwAuth = response.headers['www-authenticate'];
-        if (!wwwAuth) return fail("Got 402 but no WWW-Authenticate header.");
-
-        const macaroon = wwwAuth.match(/macaroon="([^"]+)"/)?.[1];
-        const invoice  = wwwAuth.match(/invoice="([^"]+)"/)?.[1];
-        if (!macaroon || !invoice) return fail("Could not parse macaroon/invoice from WWW-Authenticate header.");
-
-        // ── Pay the Lightning invoice and capture the preimage directly ──
-        const preimage = await payInvoice(invoice);
-        if (!preimage) return fail("Payment completed but no preimage was returned.");
-
-        // ── Retry the original request with L402 credentials ──
+        // Step 2: Retry request with L402 credentials
         const retryResponse = await axios({
             method, url,
             data: requestData,

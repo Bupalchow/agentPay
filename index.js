@@ -471,13 +471,16 @@ function createMcpServerInstance(serviceKey) {
             },
             {
                 name: "fetch_with_l402",
-                description: "Fetches data from any URL that may require Lightning payment (HTTP 402). Automatically handles invoice payment and retries with L402 header.",
+                description: "Fetches data from any URL requiring Lightning L402 payment. Can pay an existing invoice from a prior 402 response, or automatically discover, pay, and unlock.",
                 inputSchema: {
                     type: "object",
                     properties: {
-                        url: { type: "string", description: "The paywalled URL to access" },
+                        url: { type: "string", description: "The paywalled URL to access (e.g. http://localhost:3001/api/data)" },
                         method: { type: "string", enum: ["GET", "POST", "PUT", "DELETE"], default: "GET" },
-                        body: { type: "string", description: "Optional request body JSON" }
+                        body: { type: "string", description: "Optional request body JSON" },
+                        invoice: { type: "string", description: "Optional BOLT11 invoice if you already received one from a prior 402 challenge" },
+                        macaroon: { type: "string", description: "Optional L402 macaroon if you already received one from a prior 402 challenge" },
+                        preimage: { type: "string", description: "Optional payment preimage if invoice was already paid via pay_lightning_invoice" }
                     },
                     required: ["url"]
                 }
@@ -529,7 +532,7 @@ function createMcpServerInstance(serviceKey) {
                 return {
                     content: [{
                         type: "text",
-                        text: `✅ Successfully paid Lightning invoice!\n\nPreimage: ${result.preimage}\n\nNow retry your request with this header:\nAuthorization: L402 <macaroon>:${result.preimage}`
+                        text: `✅ Successfully paid Lightning invoice!\n\nPreimage: ${result.preimage}\n\nNow retry your request with this header:\nAuthorization: L402 <macaroon>:${result.preimage}\nOr pass { url, macaroon, preimage: "${result.preimage}" } to fetch_with_l402.`
                     }]
                 };
             } catch (err) {
@@ -538,37 +541,49 @@ function createMcpServerInstance(serviceKey) {
         }
 
         if (name === "fetch_with_l402") {
-            const { url, method = "GET", body } = args || {};
+            const { url, method = "GET", body, invoice: inputInvoice, macaroon: inputMacaroon, preimage: inputPreimage } = args || {};
             try {
-                let response;
+                let invoice = inputInvoice;
+                let macaroon = inputMacaroon;
+                let preimage = inputPreimage;
                 const requestData = body ? (typeof body === 'string' ? JSON.parse(body) : body) : undefined;
-                try {
-                    response = await axios({ method, url, data: requestData });
-                } catch (err) {
-                    if (!err.response || err.response.status !== 402) throw err;
-                    response = err.response;
+
+                // Step 1: Settle invoice if preimage not already provided
+                if (!preimage) {
+                    // If invoice or macaroon were not passed, probe the URL to get the 402 challenge
+                    if (!invoice || !macaroon) {
+                        let response;
+                        try {
+                            response = await axios({ method, url, data: requestData });
+                        } catch (err) {
+                            if (!err.response || err.response.status !== 402) throw err;
+                            response = err.response;
+                        }
+
+                        if (response.status !== 402) {
+                            return { content: [{ type: "text", text: `Status ${response.status}\n\n${JSON.stringify(response.data, null, 2)}` }] };
+                        }
+
+                        const wwwAuth = response.headers['www-authenticate'] || '';
+                        macaroon = macaroon || wwwAuth.match(/macaroon="([^"]+)"/)?.[1] || response.data?.macaroon;
+                        invoice = invoice || wwwAuth.match(/invoice="([^"]+)"/)?.[1] || response.data?.invoice;
+                        if (!macaroon || !invoice) {
+                            return { content: [{ type: "text", text: "❌ Got 402 but could not parse macaroon or invoice from WWW-Authenticate or response body." }], isError: true };
+                        }
+                    }
+
+                    broadcast('invoice_created', { amount: 10, agent: agent?.agentName || 'Remote MCP Agent', invoice });
+                    const paymentResult = await payVoltageInvoiceWithConfig(invoice, walletConfig);
+                    preimage = paymentResult.preimage;
+                    broadcast('payment_verified', {
+                        agent: agent?.agentName || 'Remote MCP Agent',
+                        amount: 10,
+                        preimage: paymentResult.preimage,
+                        paymentId: paymentResult.paymentId
+                    });
                 }
 
-                if (response.status !== 402) {
-                    return { content: [{ type: "text", text: `Status ${response.status}\n\n${JSON.stringify(response.data, null, 2)}` }] };
-                }
-
-                const wwwAuth = response.headers['www-authenticate'] || '';
-                const macaroon = wwwAuth.match(/macaroon="([^"]+)"/)?.[1];
-                const invoice = wwwAuth.match(/invoice="([^"]+)"/)?.[1];
-                if (!macaroon || !invoice) {
-                    return { content: [{ type: "text", text: "❌ Got 402 but could not parse macaroon or invoice from WWW-Authenticate." }], isError: true };
-                }
-
-                broadcast('invoice_created', { amount: 10, agent: agent?.agentName || 'Remote MCP Agent', invoice });
-                const paymentResult = await payVoltageInvoiceWithConfig(invoice, walletConfig);
-                broadcast('payment_verified', {
-                    agent: agent?.agentName || 'Remote MCP Agent',
-                    amount: 10,
-                    preimage: paymentResult.preimage,
-                    paymentId: paymentResult.paymentId
-                });
-
+                // Step 2: Fetch unlocked resource with Authorization: L402 <macaroon>:<preimage>
                 let retryResponse;
                 for (let attempt = 0; attempt < 5; attempt++) {
                     try {
@@ -576,7 +591,7 @@ function createMcpServerInstance(serviceKey) {
                             method,
                             url,
                             data: requestData,
-                            headers: { 'Authorization': `L402 ${macaroon}:${paymentResult.preimage}` }
+                            headers: { 'Authorization': `L402 ${macaroon}:${preimage}` }
                         });
                         if (retryResponse.status === 200) break;
                     } catch (retryErr) {
