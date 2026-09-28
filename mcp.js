@@ -7,34 +7,71 @@ const axios = require('axios');
 const crypto = require('crypto');
 
 const server = new Server({
-    name: "tollgate-l402-wallet",
+    name: "agentpay",
     version: "2.0.0"
 }, {
     capabilities: { tools: {} }
 });
 
-// ── Voltage helpers ──
-const VOLTAGE_BASE = `https://voltageapi.com/v1/organizations/${process.env.VOLTAGE_ORG_ID}/environments/${process.env.VOLTAGE_ENV_ID}/payments`;
+// ── Gateway & Wallet Dispatcher ──
+const AGENTPAY_GATEWAY_URL = process.env.AGENTPAY_GATEWAY_URL || 'http://localhost:3000';
+const AGENTPAY_SERVICE_KEY = process.env.AGENTPAY_SERVICE_KEY;
+
+// Direct Voltage fallback (for local standalone testing)
+const VOLTAGE_BASE = process.env.VOLTAGE_ORG_ID ? `https://voltageapi.com/v1/organizations/${process.env.VOLTAGE_ORG_ID}/environments/${process.env.VOLTAGE_ENV_ID}/payments` : null;
 const VOLTAGE_HEADERS = { 'x-api-key': process.env.VOLTAGE_API_KEY, 'Content-Type': 'application/json' };
 
 async function payInvoice(invoice) {
-    const id = crypto.randomUUID();
-    await axios.post(VOLTAGE_BASE, {
-        id,
-        wallet_id: process.env.VOLTAGE_WALLET_ID,
-        currency: 'btc',
-        type: 'bolt11',
-        data: { payment_request: invoice }
-    }, { headers: VOLTAGE_HEADERS });
-
-    for (let i = 0; i < 30; i++) {
-        await new Promise(r => setTimeout(r, 2000));
-        const { data } = await axios.get(`${VOLTAGE_BASE}/${id}`, { headers: VOLTAGE_HEADERS });
-        const status = data.data?.status || data.status;
-        if (status === 'completed') return;
-        if (status === 'failed') throw new Error("Lightning payment failed to route.");
+    // 1. If running with an Agent Service Key (Multi-tenant Gateway mode)
+    if (AGENTPAY_SERVICE_KEY) {
+        try {
+            const res = await axios.post(`${AGENTPAY_GATEWAY_URL}/api/gateway/pay`, { invoice }, {
+                headers: {
+                    'Authorization': `Bearer ${AGENTPAY_SERVICE_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 30000
+            });
+            if (res.data?.success && res.data?.preimage) {
+                return res.data.preimage;
+            }
+            throw new Error(res.data?.error || "Gateway did not return preimage.");
+        } catch (err) {
+            console.error("[AgentPay MCP] Gateway error:", err.response?.data?.error || err.message);
+            throw new Error(err.response?.data?.error || err.message);
+        }
     }
-    throw new Error("Payment timed out.");
+
+    // 2. Fallback to direct local Voltage credentials if configured
+    if (VOLTAGE_BASE && process.env.VOLTAGE_WALLET_ID) {
+        const id = crypto.randomUUID();
+        await axios.post(VOLTAGE_BASE, {
+            id,
+            wallet_id: process.env.VOLTAGE_WALLET_ID,
+            currency: 'btc',
+            type: 'bolt11',
+            data: { payment_request: invoice }
+        }, { headers: VOLTAGE_HEADERS });
+
+        for (let i = 0; i < 30; i++) {
+            await new Promise(r => setTimeout(r, 2000));
+            const { data } = await axios.get(`${VOLTAGE_BASE}/${id}`, { headers: VOLTAGE_HEADERS });
+            const status = data.data?.status || data.status;
+            if (status === 'completed') {
+                const preimage = data.data?.payment_preimage
+                    || data.payment_preimage
+                    || data.data?.preimage
+                    || data.preimage
+                    || data.data?.outflows?.find(o => o.data?.preimage)?.data?.preimage
+                    || data.outflows?.find(o => o.data?.preimage)?.data?.preimage;
+                return preimage;
+            }
+            if (status === 'failed') throw new Error("Lightning payment failed to route.");
+        }
+        throw new Error("Payment timed out.");
+    }
+
+    throw new Error("No wallet configured. Please set AGENTPAY_SERVICE_KEY or local wallet credentials.");
 }
 
 // ── 1. Register tools ──
@@ -42,12 +79,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
         {
             name: "pay_lightning_invoice",
-            description: "Pays a Lightning Network BOLT11 invoice and retrieves the L402 preimage receipt. Returns the verified preimage and the exact Authorization header format to retry the request.",
+            description: "Pays a Lightning Network BOLT11 invoice and retrieves the L402 preimage receipt directly from the payment response. Returns the verified preimage and the exact Authorization header format to retry the request.",
             inputSchema: {
                 type: "object",
                 properties: {
-                    invoice: { type: "string", description: "The lntb... or lnbc... invoice string" },
-                    serverUrl: { type: "string", description: "Optional API server URL (default: http://localhost:3000)" }
+                    invoice: { type: "string", description: "The lntb... or lnbc... invoice string" }
                 },
                 required: ["invoice"]
             }
@@ -59,7 +95,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 "If the server returns HTTP 402 Payment Required, this tool automatically:",
                 "  1. Extracts the Lightning invoice from the response",
                 "  2. Pays the invoice using the configured wallet",
-                "  3. Obtains the payment preimage (proof of payment)",
+                "  3. Obtains the payment preimage directly from the payment response",
                 "  4. Retries the request with the L402 Authorization header",
                 "  5. Returns the final data",
                 "",
@@ -81,24 +117,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 // ── 2. Tool Handlers ──
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (request.params.name === "pay_lightning_invoice") {
-        const { invoice, serverUrl = "http://localhost:3000" } = request.params.arguments || {};
+        const { invoice } = request.params.arguments || {};
         if (!invoice) return fail("Missing required 'invoice' parameter.");
         try {
-            await payInvoice(invoice);
-
-            // Fetch the verified preimage from the server
-            let preimage;
-            for (let i = 0; i < 15; i++) {
-                try {
-                    const { data } = await axios.get(`${serverUrl}/api/preimage/${encodeURIComponent(invoice)}`);
-                    if (data?.preimage) {
-                        preimage = data.preimage;
-                        break;
-                    }
-                } catch (e) {
-                    await new Promise(r => setTimeout(r, 1000));
-                }
-            }
+            const preimage = await payInvoice(invoice);
 
             if (preimage) {
                 return ok(
@@ -144,33 +166,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const invoice  = wwwAuth.match(/invoice="([^"]+)"/)?.[1];
         if (!macaroon || !invoice) return fail("Could not parse macaroon/invoice from WWW-Authenticate header.");
 
-        // ── Pay the Lightning invoice ──
-        await payInvoice(invoice);
-
-        // ── Get the preimage from the server ──
-        //    Decode the macaroon to find the paymentHash, then ask the server's /api/preimage endpoint.
-        const origin = new URL(url).origin;
-        const { MacaroonsBuilder } = require('macaroons.js');
-        const mac = MacaroonsBuilder.deserialize(macaroon);
-        const paymentHash = mac.identifier;
-
-        let preimage;
-        for (let i = 0; i < 10; i++) {
-            try {
-                const { data } = await axios.get(`${origin}/api/preimage/${paymentHash}`);
-                preimage = data.preimage;
-                break;
-            } catch (err) {
-                if (err.response?.status === 402) {
-                    // Invoice not settled yet on the server side, wait and retry
-                    await new Promise(r => setTimeout(r, 2000));
-                    continue;
-                }
-                throw err;
-            }
-        }
-
-        if (!preimage) return fail("Paid the invoice but server has not confirmed settlement yet.");
+        // ── Pay the Lightning invoice and capture the preimage directly ──
+        const preimage = await payInvoice(invoice);
+        if (!preimage) return fail("Payment completed but no preimage was returned.");
 
         // ── Retry the original request with L402 credentials ──
         const retryResponse = await axios({
@@ -193,4 +191,4 @@ function ok(text)   { return { content: [{ type: "text", text }] }; }
 function fail(text)  { return { content: [{ type: "text", text: `❌ ${text}` }], isError: true }; }
 
 const transport = new StdioServerTransport();
-server.connect(transport).then(() => console.error("Tollgate MCP Server v2 running."));
+server.connect(transport).then(() => console.error("AgentPay MCP Server running."));
