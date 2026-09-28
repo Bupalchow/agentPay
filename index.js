@@ -4,14 +4,13 @@ const axios = require('axios');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const macaroons = require('macaroons.js');
-const bolt11 = require('bolt11');
-
 const cors = require('cors');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
 
 // ── Server-Sent Events (SSE) for Mission Control Dashboard ──
 let clients = [];
@@ -36,221 +35,12 @@ app.get('/api/stream', (req, res) => {
     clients.push(res);
     console.log(`[SSE] Client connected. Total clients: ${clients.length}`);
 
-    // Send initial connection comment
     res.write(': connected\n\n');
 
     req.on('close', () => {
         clients = clients.filter(c => c !== res);
         console.log(`[SSE] Client disconnected. Total clients: ${clients.length}`);
     });
-});
-
-const MACAROON_SECRET = "super-secret-hackathon-key";
-const VOLTAGE_BASE = `https://voltageapi.com/v1/organizations/${process.env.VOLTAGE_ORG_ID}/environments/${process.env.VOLTAGE_ENV_ID}/payments`;
-const VOLTAGE_HEADERS = { 'x-api-key': process.env.VOLTAGE_API_KEY, 'Content-Type': 'application/json' };
-
-// ── Helper: Decode BOLT11 invoice (handles standard + signet/mutinynet) ──
-function decodeInvoice(invoice) {
-    try {
-        return bolt11.decode(invoice);
-    } catch (err) {
-        if (err.message && err.message.includes('Unknown coin bech32 prefix')) {
-            const hrp = invoice.slice(0, invoice.lastIndexOf('1'));
-            const match = hrp.match(/^ln(\S+?)(\d*)([a-zA-Z]?)$/);
-            const prefix = match ? match[1] : 'tbs';
-            return bolt11.decode(invoice, {
-                bech32: prefix,
-                pubKeyHash: 0x6f,
-                scriptHash: 0xc4,
-                validWitnessVersions: [0, 1]
-            });
-        }
-        throw err;
-    }
-}
-
-// ── Helper: Create a Voltage invoice ──
-async function createInvoice(amountSats) {
-    const paymentId = crypto.randomUUID();
-
-    await axios.post(VOLTAGE_BASE, {
-        id: paymentId,
-        wallet_id: process.env.VOLTAGE_WALLET_ID,
-        payment_kind: 'bolt11',
-        amount: { currency: 'btc', amount: amountSats * 1000, unit: 'msats' },
-        description: "AgentPay API Access"
-    }, { headers: VOLTAGE_HEADERS });
-
-    // Poll until the invoice string is ready
-    for (let i = 0; i < 15; i++) {
-        await new Promise(r => setTimeout(r, 1000));
-        const { data } = await axios.get(`${VOLTAGE_BASE}/${paymentId}`, { headers: VOLTAGE_HEADERS });
-        if (data.data?.payment_request) {
-            const invoice = data.data.payment_request;
-            const decoded = decodeInvoice(invoice);
-            const paymentHash = decoded.tags.find(t => t.tagName === 'payment_hash').data;
-            broadcast('invoice_created', { paymentHash, amount: 10 });
-            return { invoice, paymentHash };
-        }
-    }
-    throw new Error("Timed out waiting for Voltage to generate the invoice.");
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// THE PAYWALLED ENDPOINT
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-app.get('/api/data', async (req, res) => {
-    const authHeader = req.headers.authorization;
-
-    // ── No token → issue 402 challenge ──
-    if (!authHeader || !authHeader.startsWith('L402 ')) {
-        try {
-            const { invoice, paymentHash } = await createInvoice(10);
-            const mac = macaroons.MacaroonsBuilder.create("agentpay.local", MACAROON_SECRET, paymentHash);
-
-            console.log(`[402] New challenge issued hash=${paymentHash.slice(0, 16)}…`);
-
-            return res.status(402)
-                .header('WWW-Authenticate', `L402 macaroon="${mac.serialize()}", invoice="${invoice}"`)
-                .json({ error: "Payment Required to access API" });
-        } catch (err) {
-            console.error("Invoice error:", err.response?.data || err.message);
-            return res.status(500).json({ error: "Failed to generate Lightning invoice." });
-        }
-    }
-
-    // ── Client sent an L402 token → verify it ──
-    try {
-        const [serializedMac, preimageHex] = authHeader.split(' ')[1].split(':');
-        const mac = macaroons.MacaroonsBuilder.deserialize(serializedMac);
-        const expectedHash = mac.identifier;
-
-        // Crypto check: SHA256(preimage) must equal the hash baked into the macaroon
-        const actualHash = crypto.createHash('sha256').update(Buffer.from(preimageHex, 'hex')).digest('hex');
-        if (actualHash !== expectedHash) {
-            return res.status(401).json({ error: "Invalid payment preimage." });
-        }
-
-        // Macaroon signature check
-        if (!new macaroons.MacaroonsVerifier(mac).isValid(MACAROON_SECRET)) {
-            return res.status(401).json({ error: "Invalid or forged macaroon." });
-        }
-
-        const paymentHash = expectedHash;
-        broadcast('payment_verified', { paymentHash });
-        console.log(`[200] Payment verified! hash=${expectedHash.slice(0, 16)}…`);
-
-        return res.json({
-            success: true,
-            message: "AgentPay paywall bypassed successfully using Machine Money!",
-            data: { asset: "TSLA", price: 245.89, status: "Premium data unlocked" }
-        });
-    } catch (err) {
-        console.error("Verification error:", err);
-        return res.status(401).json({ error: "Malformed L402 authorization header." });
-    }
-});
-
-// ── Agent Simulation Endpoint (Executes REAL Lightning Payment on Voltage) ──
-app.post('/api/simulate-agent', async (req, res) => {
-    const { agentName = 'Autonomous Market Agent', serviceKey, agentId } = req.body || {};
-
-    // 1. Resolve agent wallet configuration
-    let agent = null;
-    if (serviceKey) agent = agentKeys.find(k => k.serviceKey === serviceKey);
-    if (!agent && agentId) agent = agentKeys.find(k => k.id === agentId);
-    if (!agent && agentKeys.length > 0) agent = agentKeys[0];
-
-    const walletConfig = (agent?.walletConfig && agent.walletConfig.apiKey) ? agent.walletConfig : {
-        orgId: process.env.VOLTAGE_ORG_ID,
-        envId: process.env.VOLTAGE_ENV_ID,
-        walletId: process.env.VOLTAGE_WALLET_ID,
-        apiKey: process.env.VOLTAGE_API_KEY
-    };
-
-    console.log(`[SIMULATION] Starting REAL Lightning payment execution for '${agentName}'...`);
-
-    try {
-        // Step 1: Create a REAL 10 sat BOLT11 invoice on Voltage
-        console.log(`[SIMULATION] Generating real 10 sat Mutinynet invoice on Voltage...`);
-        const { invoice, paymentHash } = await createInvoice(10);
-        console.log(`[SIMULATION] Real invoice generated: ${invoice.slice(0, 32)}... (hash: ${paymentHash.slice(0, 16)}...)`);
-
-        // Broadcast invoice created event with real hash and invoice
-        broadcast('invoice_created', { paymentHash, amount: 10, agent: agentName, invoice });
-
-        // Step 2: Execute REAL payment from the wallet on Voltage
-        console.log(`[SIMULATION] Executing real payment from wallet ${walletConfig.walletId}...`);
-        const paymentResult = await payVoltageInvoiceWithConfig(invoice, walletConfig);
-        console.log(`[SIMULATION] REAL Lightning payment completed on Voltage wallet! ID: ${paymentResult.paymentId}`);
-
-        // Step 3: Broadcast payment verified event with real hash
-        broadcast('payment_verified', {
-            paymentHash,
-            agent: agentName,
-            amount: 10,
-            preimage: paymentResult.preimage,
-            paymentId: paymentResult.paymentId
-        });
-
-        return res.json({
-            success: true,
-            agent: agentName,
-            paymentHash,
-            invoice,
-            preimage: paymentResult.preimage,
-            amount: 10,
-            network: 'Mutinynet Signet (Voltage Cloud Node)',
-            voltageDetails: {
-                paymentId: paymentResult.paymentId,
-                walletId: paymentResult.walletId,
-                ledgerId: paymentResult.ledgerId,
-                offsetPaymentId: paymentResult.offsetPaymentId,
-                status: paymentResult.status,
-                createdAt: paymentResult.createdAt
-            },
-            settlement: 'Mutinynet Signet (Real Voltage Outflow Settled)',
-            data: {
-                asset: "TSLA",
-                price: 245.89,
-                status: "Premium data unlocked via real Lightning payment",
-                timestamp: new Date().toISOString()
-            }
-        });
-    } catch (err) {
-        console.error('[SIMULATION] Real payment failed:', err.response?.data || err.message);
-        return res.status(500).json({
-            error: `Real Lightning payment failed: ${err.response?.data?.message || err.message}`
-        });
-    }
-});
-
-// ── Get Recent Payments from Voltage Wallet (Real Ledger Activity) ──
-app.get('/api/wallet/recent-payments', async (req, res) => {
-    try {
-        const orgId = process.env.VOLTAGE_ORG_ID;
-        const envId = process.env.VOLTAGE_ENV_ID;
-        const apiKey = process.env.VOLTAGE_API_KEY;
-        const base = `https://voltageapi.com/v1/organizations/${orgId}/environments/${envId}/payments?limit=6`;
-        const { data } = await axios.get(base, { headers: { 'x-api-key': apiKey } });
-        return res.json({
-            success: true,
-            walletId: process.env.VOLTAGE_WALLET_ID,
-            items: (data.items || []).map(item => ({
-                id: item.id,
-                direction: item.direction,
-                status: item.status,
-                amountSats: (item.data?.amount_msats || 0) / 1000,
-                memo: item.data?.memo || 'AgentPay Lightning Payment',
-                createdAt: item.created_at,
-                ledgerId: item.data?.outflows?.[0]?.data?.ledger_id || item.data?.receipts?.[0]?.data?.ledger_id || null,
-                invoicePreview: item.data?.payment_request ? `${item.data.payment_request.slice(0, 24)}...` : null
-            }))
-        });
-    } catch (err) {
-        console.error('[WALLET] Error fetching payments:', err.response?.data || err.message);
-        return res.status(500).json({ error: err.response?.data?.message || err.message });
-    }
 });
 
 // ── Helper: Pay an invoice with specific Voltage credentials ──
@@ -287,6 +77,9 @@ async function payVoltageInvoiceWithConfig(invoice, config) {
 
             const outflow = data.data?.outflows?.[0]?.data || data.outflows?.[0]?.data || {};
 
+            // Brief settlement grace period to allow Voltage ledger to update receiver invoice
+            await new Promise(r => setTimeout(r, 600));
+
             return {
                 paymentId,
                 walletId,
@@ -303,19 +96,32 @@ async function payVoltageInvoiceWithConfig(invoice, config) {
     throw new Error("Voltage payment timed out.");
 }
 
-// ── Firebase Admin Authentication ──
+// ── Firebase Admin Authentication & Firestore Database ──
 const admin = require('firebase-admin');
+const { cert } = require('firebase-admin/app');
 const { getAuth } = require('firebase-admin/auth');
+const { getFirestore } = require('firebase-admin/firestore');
 
 if (!admin.getApps().length) {
-    admin.initializeApp({
-        projectId: process.env.FIREBASE_PROJECT_ID || 'proximity-51dec'
-    });
+    const serviceAccountPath = path.join(__dirname, 'serviceAccountKey.json');
+    if (fs.existsSync(serviceAccountPath)) {
+        admin.initializeApp({
+            credential: cert(require(serviceAccountPath)),
+            projectId: process.env.FIREBASE_PROJECT_ID || 'proximity-51dec'
+        });
+        console.log('[Firebase] Initialized Admin SDK with serviceAccountKey.json (Firestore Cloud Connected)');
+    } else {
+        admin.initializeApp({
+            projectId: process.env.FIREBASE_PROJECT_ID || 'proximity-51dec'
+        });
+        console.log('[Firebase] Initialized with default project config');
+    }
 }
 
 const firebaseAuth = getAuth();
+const db = getFirestore();
 
-// Middleware: Verify Firebase ID Token for user routes
+// Middleware: Verify Firebase ID Token for protected user routes
 async function verifyFirebaseAuth(req, res, next) {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -333,79 +139,108 @@ async function verifyFirebaseAuth(req, res, next) {
     }
 }
 
-// ── Multi-Wallet Agent Key Gateway Storage ──
-const DATA_FILE = path.join(__dirname, 'data', 'agents.json');
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// AGENT PROVISIONING ENDPOINTS (Direct Firestore Cloud Database)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-function loadAgentKeys() {
+// Register new Agent + Wallet Credentials directly to Firestore
+app.post('/api/keys', verifyFirebaseAuth, async (req, res) => {
     try {
-        if (fs.existsSync(DATA_FILE)) {
-            const raw = fs.readFileSync(DATA_FILE, 'utf8');
-            const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) return parsed;
-        }
-    } catch (err) {
-        console.error("Error reading agents.json:", err.message);
-    }
-    return [];
-}
+        const { agentName = 'Autonomous Agent', walletType = 'voltage', walletConfig = {} } = req.body || {};
+        const userId = req.user.uid;
+        const serviceKey = 'ap_live_' + crypto.randomBytes(12).toString('hex');
+        const keyId = 'key_' + Date.now();
 
-function saveAgentKeys(keys) {
-    try {
-        fs.writeFileSync(DATA_FILE, JSON.stringify(keys, null, 2), 'utf8');
-    } catch (err) {
-        console.error("Error saving agents.json:", err.message);
-    }
-}
+        const newKey = {
+            id: keyId,
+            userId,
+            serviceKey,
+            agentName,
+            walletType,
+            walletConfig,
+            createdAt: new Date().toISOString(),
+            network: walletType === 'nwc' ? 'NWC (Alby/Primal/Mutiny)' : walletType === 'lnd' ? 'LND Custom Node' : 'Voltage Cloud (Mutinynet)',
+            active: true
+        };
 
-let agentKeys = loadAgentKeys();
+        // 1. Save in user's subcollection for console listing
+        await db.doc(`users/${userId}/agents/${keyId}`).set(newKey);
+        // 2. Save in top-level agent_keys for instant O(1) gateway lookups
+        await db.collection('agent_keys').doc(serviceKey).set(newKey);
 
-// Endpoint: Register new Agent + Wallet Credentials (Protected by Firebase Auth)
-app.post('/api/keys', verifyFirebaseAuth, (req, res) => {
-    const { agentName = 'Autonomous Agent', walletType = 'voltage', walletConfig = {} } = req.body || {};
-    const userId = req.user.uid;
-    const serviceKey = 'ap_live_' + crypto.randomBytes(12).toString('hex');
+        console.log(`[FIRESTORE] Registered new agent '${agentName}' (${walletType}) for user ${userId.slice(0, 8)}...`);
 
-    const newKey = {
-        id: 'key_' + Date.now(),
-        userId,
-        serviceKey,
-        agentName,
-        walletType,
-        walletConfig,
-        createdAt: new Date().toISOString(),
-        network: walletType === 'nwc' ? 'NWC (Alby/Primal/Mutiny)' : walletType === 'lnd' ? 'LND Custom Node' : 'Voltage Cloud (Mutinynet)',
-        active: true
-    };
-
-    agentKeys.unshift(newKey);
-    saveAgentKeys(agentKeys);
-    console.log(`[KEY] Registered new agent '${agentName}' (${walletType}) for user ${userId.slice(0, 8)}...`);
-
-    return res.json({
-        success: true,
-        key: newKey,
-        mcpConfig: {
-            agentpay: {
-                command: "node",
-                args: ["<path-to-agentPay>/mcp.js"],
-                env: {
-                    AGENTPAY_SERVICE_KEY: serviceKey,
-                    AGENTPAY_GATEWAY_URL: "http://localhost:3000"
+        return res.json({
+            success: true,
+            key: newKey,
+            mcpConfig: {
+                remote: {
+                    url: `http://localhost:${PORT}/sse`,
+                    headers: { Authorization: `Bearer ${serviceKey}` }
+                },
+                stdio: {
+                    command: "node",
+                    args: ["./mcp.js"],
+                    env: {
+                        AGENTPAY_SERVICE_KEY: serviceKey,
+                        AGENTPAY_GATEWAY_URL: `http://localhost:${PORT}`
+                    }
                 }
             }
-        }
-    });
+        });
+    } catch (err) {
+        console.error('[FIRESTORE] Error saving agent:', err.message);
+        return res.status(500).json({ error: `Failed to save agent to Firestore: ${err.message}` });
+    }
 });
 
-// Endpoint: Fetch keys belonging to authenticated user
-app.get('/api/keys', verifyFirebaseAuth, (req, res) => {
-    const userId = req.user.uid;
-    const userKeys = agentKeys.filter(k => k.userId === userId);
-    return res.json({ success: true, keys: userKeys });
+// Fetch keys belonging to authenticated user directly from Firestore
+app.get('/api/keys', verifyFirebaseAuth, async (req, res) => {
+    try {
+        const userId = req.user.uid;
+        const snap = await db.collection(`users/${userId}/agents`).get();
+        const userKeys = [];
+        snap.forEach(docSnap => userKeys.push({ id: docSnap.id, ...docSnap.data() }));
+        return res.json({ success: true, keys: userKeys });
+    } catch (err) {
+        console.error('[FIRESTORE] Error fetching keys:', err.message);
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete Agent from Firestore (Removes from both user collection and agent_keys table)
+app.delete('/api/keys/:id', verifyFirebaseAuth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user.uid;
+
+        const docRef = db.doc(`users/${userId}/agents/${id}`);
+        const docSnap = await docRef.get();
+
+        if (!docSnap.exists) {
+            return res.status(404).json({ error: "Agent not found." });
+        }
+
+        const agentData = docSnap.data();
+
+        // 1. Delete from user's subcollection
+        await docRef.delete();
+
+        // 2. Delete from top-level agent_keys table
+        if (agentData.serviceKey) {
+            await db.collection('agent_keys').doc(agentData.serviceKey).delete();
+        }
+
+        console.log(`[FIRESTORE] Deleted agent '${agentData.agentName}' (${id}) for user ${userId.slice(0, 8)}`);
+        return res.json({ success: true, message: "Agent deleted successfully." });
+    } catch (err) {
+        console.error('[FIRESTORE] Error deleting agent:', err.message);
+        return res.status(500).json({ error: `Failed to delete agent: ${err.message}` });
+    }
 });
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// ENDPOINT: MCP PAYMENT GATEWAY (Called by agent's MCP tool)
+// MCP PAYMENT GATEWAY (Queries Firestore directly by serviceKey)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 app.post('/api/gateway/pay', async (req, res) => {
     const authHeader = req.headers.authorization;
@@ -414,7 +249,17 @@ app.post('/api/gateway/pay', async (req, res) => {
     }
 
     const serviceKey = authHeader.replace(/^Bearer\s+/i, '').trim();
-    const agent = agentKeys.find(k => k.serviceKey === serviceKey);
+
+    // Query Firestore directly for the serviceKey
+    let agent = null;
+    try {
+        const keyDoc = await db.collection('agent_keys').doc(serviceKey).get();
+        if (keyDoc.exists) {
+            agent = keyDoc.data();
+        }
+    } catch (dbErr) {
+        console.error('[GATEWAY] Firestore lookup error:', dbErr.message);
+    }
 
     if (!agent) {
         return res.status(403).json({ error: "Invalid or unknown Agent Service Key. Please register your agent in AgentPay." });
@@ -422,49 +267,438 @@ app.post('/api/gateway/pay', async (req, res) => {
 
     const { invoice } = req.body || {};
     if (!invoice) {
-        return res.status(400).json({ error: "Missing required 'invoice' parameter." });
+        return res.status(400).json({ error: "Missing required parameter 'invoice'." });
     }
 
-    console.log(`[GATEWAY] Payment request received from Agent '${agent.agentName}' using wallet: ${agent.walletType}`);
+    console.log(`[GATEWAY] Payment request received from Agent '${agent.agentName}' (${agent.walletType})...`);
 
     try {
-        let preimage = null;
-
-        if (agent.walletType === 'voltage') {
-            preimage = await payVoltageInvoiceWithConfig(invoice, agent.walletConfig || {});
-        } else if (agent.walletType === 'nwc') {
-            // Simulated NWC or real NWC relay execution
-            console.log(`[GATEWAY] Paying via NWC URI: ${agent.walletConfig?.nwcUri?.slice(0, 20)}...`);
-            await new Promise(r => setTimeout(r, 1200));
-            preimage = crypto.randomBytes(32).toString('hex');
-        } else {
-            // Custom LND
-            console.log(`[GATEWAY] Paying via Custom LND node`);
-            await new Promise(r => setTimeout(r, 1000));
-            preimage = crypto.randomBytes(32).toString('hex');
+        if (agent.walletType === 'voltage' || !agent.walletType) {
+            const result = await payVoltageInvoiceWithConfig(invoice, agent.walletConfig || {});
+            console.log(`[GATEWAY] Voltage payment settled for Agent '${agent.agentName}'!`);
+            broadcast('payment_verified', {
+                agent: agent.agentName,
+                amount: 10,
+                preimage: result.preimage,
+                paymentId: result.paymentId
+            });
+            return res.json({ success: true, preimage: result.preimage, paymentId: result.paymentId });
         }
 
-        const paymentHash = crypto.createHash('sha256').update(Buffer.from(preimage, 'hex')).digest('hex');
+        if (agent.walletType === 'nwc') {
+            return res.status(501).json({ error: "NWC execution available via direct client NWC dispatch." });
+        }
 
-        // Broadcast to SSE stream so user's dashboard shows the live agent payment in real time!
-        broadcast('payment_verified', {
-            paymentHash,
-            agent: agent.agentName,
-            walletType: agent.walletType,
-            amount: 10
-        });
+        if (agent.walletType === 'lnd') {
+            return res.status(501).json({ error: "LND REST execution available via direct client LND dispatch." });
+        }
 
-        return res.json({
-            success: true,
-            preimage,
-            agent: agent.agentName,
-            message: `Successfully settled payment via ${agent.agentName}'s ${agent.walletType} wallet!`
-        });
+        throw new Error("Unsupported wallet type.");
     } catch (err) {
-        console.error(`[GATEWAY] Payment failed for agent '${agent.agentName}':`, err.message);
-        return res.status(500).json({ error: `Payment failed: ${err.message}` });
+        console.error(`[GATEWAY] Payment routing failed:`, err.response?.data || err.message);
+        return res.status(500).json({ error: `Payment failed: ${err.response?.data?.message || err.message}` });
     }
 });
 
-const PORT = 3000;
-app.listen(PORT, () => console.log(`AgentPay Proxy listening on http://localhost:${PORT}`));
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// VOLTAGE NODE WALLET MONITORING (Agent Wallet Activity)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+app.get('/api/wallet/recent-payments', async (req, res) => {
+    try {
+        const orgId = process.env.VOLTAGE_ORG_ID;
+        const envId = process.env.VOLTAGE_ENV_ID;
+        const apiKey = process.env.VOLTAGE_API_KEY;
+        const base = `https://voltageapi.com/v1/organizations/${orgId}/environments/${envId}/payments?limit=6`;
+        const { data } = await axios.get(base, { headers: { 'x-api-key': apiKey } });
+        return res.json({
+            success: true,
+            walletId: process.env.VOLTAGE_WALLET_ID,
+            items: (data.items || []).map(item => ({
+                id: item.id,
+                direction: item.direction,
+                status: item.status,
+                amountSats: (item.data?.amount_msats || 0) / 1000,
+                memo: item.data?.memo || 'AgentPay Lightning Payment',
+                createdAt: item.created_at,
+                ledgerId: item.data?.outflows?.[0]?.data?.ledger_id || item.data?.receipts?.[0]?.data?.ledger_id || null,
+                invoicePreview: item.data?.payment_request ? `${item.data.payment_request.slice(0, 24)}...` : null
+            }))
+        });
+    } catch (err) {
+        console.error('[WALLET] Error fetching payments:', err.response?.data || err.message);
+        return res.status(500).json({ error: err.response?.data?.message || err.message });
+    }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// AGENT SIMULATION ENDPOINT (Queries external merchant at :3001 & pays via gateway)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+app.post('/api/simulate-agent', async (req, res) => {
+    const { agentName = 'Autonomous Market Agent', serviceKey, agentId } = req.body || {};
+
+    let agent = null;
+    if (serviceKey) {
+        try {
+            const docSnap = await db.collection('agent_keys').doc(serviceKey).get();
+            if (docSnap.exists) agent = docSnap.data();
+        } catch (e) {}
+    }
+
+    const walletConfig = (agent?.walletConfig && agent.walletConfig.apiKey) ? agent.walletConfig : {
+        orgId: process.env.VOLTAGE_ORG_ID,
+        envId: process.env.VOLTAGE_ENV_ID,
+        walletId: process.env.VOLTAGE_WALLET_ID || '137fa5a5-a910-4964-926d-cb6de6005a10',
+        apiKey: process.env.VOLTAGE_API_KEY
+    };
+
+    console.log(`[SIMULATION] Starting agent execution for '${agentName}'...`);
+
+    const MERCHANT_URL = process.env.MERCHANT_URL || 'http://localhost:3001/api/data';
+
+    try {
+        // Step 1: Agent attempts to access the paywalled Merchant Site (Port 3001)
+        console.log(`[SIMULATION] Step 1: Agent requests data from Merchant at ${MERCHANT_URL}...`);
+        let invoice = null;
+        let macaroon = null;
+        let paymentHash = null;
+
+        try {
+            await axios.get(MERCHANT_URL);
+        } catch (err) {
+            if (err.response?.status === 402) {
+                const wwwAuth = err.response.headers['www-authenticate'] || '';
+                macaroon = wwwAuth.match(/macaroon="([^"]+)"/)?.[1];
+                invoice = wwwAuth.match(/invoice="([^"]+)"/)?.[1];
+            } else {
+                throw new Error(`Merchant site at ${MERCHANT_URL} is unreachable. Ensure the merchant server is running ('npm run merchant').`);
+            }
+        }
+
+        if (!invoice || !macaroon) {
+            throw new Error("Merchant response did not contain a valid L402 challenge with invoice and macaroon.");
+        }
+
+        // Broadcast invoice created event to dashboard
+        broadcast('invoice_created', { amount: 10, agent: agentName, invoice });
+
+        // Step 2: AgentPay Gateway settles the invoice using the Agent's wallet
+        console.log(`[SIMULATION] Step 2: AgentPay Gateway routing payment from Agent Wallet (${walletConfig.walletId})...`);
+        const paymentResult = await payVoltageInvoiceWithConfig(invoice, walletConfig);
+        console.log(`[SIMULATION] Step 3: Payment settled! Preimage: ${paymentResult.preimage.slice(0, 16)}...`);
+
+        // Broadcast payment verified event to dashboard
+        broadcast('payment_verified', {
+            agent: agentName,
+            amount: 10,
+            preimage: paymentResult.preimage,
+            paymentId: paymentResult.paymentId
+        });
+
+        // Step 3: Agent retries request to Merchant with L402 Authorization header
+        console.log(`[SIMULATION] Step 4: Submitting Authorization: L402 to Merchant...`);
+        let unlockedRes;
+        for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+                unlockedRes = await axios.get(MERCHANT_URL, {
+                    headers: { 'Authorization': `L402 ${macaroon}:${paymentResult.preimage}` }
+                });
+                if (unlockedRes.status === 200) break;
+            } catch (retryErr) {
+                if (retryErr.response?.status === 401 && attempt < 4) {
+                    console.log(`[SIMULATION] Waiting for invoice settlement to clear on ledger (attempt ${attempt + 1}/5)...`);
+                    await new Promise(r => setTimeout(r, 600));
+                    continue;
+                }
+                throw retryErr;
+            }
+        }
+
+        return res.json({
+            success: true,
+            agent: agentName,
+            merchantUrl: MERCHANT_URL,
+            invoice,
+            preimage: paymentResult.preimage,
+            amount: 10,
+            network: 'Mutinynet Signet (Voltage Cloud Node)',
+            voltageDetails: {
+                paymentId: paymentResult.paymentId,
+                walletId: paymentResult.walletId,
+                ledgerId: paymentResult.ledgerId,
+                status: paymentResult.status,
+                createdAt: paymentResult.createdAt
+            },
+            data: unlockedRes.data?.data || unlockedRes.data
+        });
+    } catch (err) {
+        console.error('[SIMULATION] Flow failed:', err.response?.data || err.message);
+        return res.status(500).json({
+            error: `Agent payment flow failed: ${err.response?.data?.message || err.message}`
+        });
+    }
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// REMOTE MCP SERVER (SSE TRANSPORT) - For Claude Desktop, Cursor, Remote Agents
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const { Server: McpServer } = require("@modelcontextprotocol/sdk/server/index.js");
+const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");
+const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
+const { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest } = require("@modelcontextprotocol/sdk/types.js");
+
+const activeTransports = new Map();
+
+function createMcpServerInstance(serviceKey) {
+    const mcp = new McpServer({
+        name: "agentpay",
+        version: "2.0.0"
+    }, {
+        capabilities: { tools: {} }
+    });
+
+    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+        tools: [
+            {
+                name: "pay_lightning_invoice",
+                description: "Pays a Lightning Network BOLT11 invoice and retrieves the L402 preimage receipt. Returns the preimage and exact Authorization header format.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        invoice: { type: "string", description: "The lntb... or lnbc... invoice string" }
+                    },
+                    required: ["invoice"]
+                }
+            },
+            {
+                name: "fetch_with_l402",
+                description: "Fetches data from any URL that may require Lightning payment (HTTP 402). Automatically handles invoice payment and retries with L402 header.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        url: { type: "string", description: "The paywalled URL to access" },
+                        method: { type: "string", enum: ["GET", "POST", "PUT", "DELETE"], default: "GET" },
+                        body: { type: "string", description: "Optional request body JSON" }
+                    },
+                    required: ["url"]
+                }
+            }
+        ]
+    }));
+
+    mcp.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+        const { name, arguments: args } = request.params;
+
+        // Extract active serviceKey from headers, query string, or extra request context
+        const authHeader = extra?.requestInfo?.headers?.authorization;
+        let queryKey = null;
+        if (extra?.requestInfo?.url) {
+            try {
+                queryKey = new URL(extra.requestInfo.url).searchParams.get('key');
+            } catch (e) {}
+        }
+        const activeKey = (authHeader ? authHeader.replace(/^Bearer\s+/i, '').trim() : null) || queryKey || serviceKey;
+
+        let agent = null;
+        if (activeKey) {
+            try {
+                const keyDoc = await db.collection('agent_keys').doc(activeKey).get();
+                if (keyDoc.exists) agent = keyDoc.data();
+            } catch (e) {
+                console.error('[MCP Tool] Error fetching agent from Firestore:', e.message);
+            }
+        }
+        const walletConfig = agent?.walletConfig || {
+            orgId: process.env.VOLTAGE_ORG_ID,
+            envId: process.env.VOLTAGE_ENV_ID,
+            walletId: process.env.VOLTAGE_WALLET_ID,
+            apiKey: process.env.VOLTAGE_API_KEY
+        };
+
+        if (name === "pay_lightning_invoice") {
+            const { invoice } = args || {};
+            if (!invoice) return { content: [{ type: "text", text: "❌ Missing required 'invoice' parameter." }], isError: true };
+
+            try {
+                const result = await payVoltageInvoiceWithConfig(invoice, walletConfig);
+                broadcast('payment_verified', {
+                    agent: agent?.agentName || 'Remote MCP Agent',
+                    amount: 10,
+                    preimage: result.preimage,
+                    paymentId: result.paymentId
+                });
+                return {
+                    content: [{
+                        type: "text",
+                        text: `✅ Successfully paid Lightning invoice!\n\nPreimage: ${result.preimage}\n\nNow retry your request with this header:\nAuthorization: L402 <macaroon>:${result.preimage}`
+                    }]
+                };
+            } catch (err) {
+                return { content: [{ type: "text", text: `❌ Payment failed: ${err.message}` }], isError: true };
+            }
+        }
+
+        if (name === "fetch_with_l402") {
+            const { url, method = "GET", body } = args || {};
+            try {
+                let response;
+                const requestData = body ? (typeof body === 'string' ? JSON.parse(body) : body) : undefined;
+                try {
+                    response = await axios({ method, url, data: requestData });
+                } catch (err) {
+                    if (!err.response || err.response.status !== 402) throw err;
+                    response = err.response;
+                }
+
+                if (response.status !== 402) {
+                    return { content: [{ type: "text", text: `Status ${response.status}\n\n${JSON.stringify(response.data, null, 2)}` }] };
+                }
+
+                const wwwAuth = response.headers['www-authenticate'] || '';
+                const macaroon = wwwAuth.match(/macaroon="([^"]+)"/)?.[1];
+                const invoice = wwwAuth.match(/invoice="([^"]+)"/)?.[1];
+                if (!macaroon || !invoice) {
+                    return { content: [{ type: "text", text: "❌ Got 402 but could not parse macaroon or invoice from WWW-Authenticate." }], isError: true };
+                }
+
+                broadcast('invoice_created', { amount: 10, agent: agent?.agentName || 'Remote MCP Agent', invoice });
+                const paymentResult = await payVoltageInvoiceWithConfig(invoice, walletConfig);
+                broadcast('payment_verified', {
+                    agent: agent?.agentName || 'Remote MCP Agent',
+                    amount: 10,
+                    preimage: paymentResult.preimage,
+                    paymentId: paymentResult.paymentId
+                });
+
+                let retryResponse;
+                for (let attempt = 0; attempt < 5; attempt++) {
+                    try {
+                        retryResponse = await axios({
+                            method,
+                            url,
+                            data: requestData,
+                            headers: { 'Authorization': `L402 ${macaroon}:${paymentResult.preimage}` }
+                        });
+                        if (retryResponse.status === 200) break;
+                    } catch (retryErr) {
+                        if (retryErr.response?.status === 401 && attempt < 4) {
+                            console.log(`[MCP Tool] Waiting for invoice settlement to clear on ledger (attempt ${attempt + 1}/5)...`);
+                            await new Promise(r => setTimeout(r, 600));
+                            continue;
+                        }
+                        throw retryErr;
+                    }
+                }
+
+                return {
+                    content: [{
+                        type: "text",
+                        text: `✅ Paid Lightning invoice & unlocked data via AgentPay!\n\n${JSON.stringify(retryResponse.data, null, 2)}`
+                    }]
+                };
+            } catch (err) {
+                return { content: [{ type: "text", text: `❌ Error in fetch_with_l402: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}` }], isError: true };
+            }
+        }
+
+        throw new Error("Unknown tool: " + name);
+    });
+
+    return mcp;
+}
+
+// 1. STREAMABLE HTTP TRANSPORT (Antigravity IDE, Gemini CLI, Streamable HTTP Clients)
+const handleStreamableHttp = async (req, res) => {
+    try {
+        const sessionId = req.headers['mcp-session-id'];
+        let transport;
+
+        if (sessionId && activeTransports.has(sessionId)) {
+            transport = activeTransports.get(sessionId);
+        } else if (!sessionId && req.method === 'POST' && isInitializeRequest(req.body)) {
+            const authHeader = req.headers.authorization;
+            const queryKey = req.query.key;
+            const serviceKey = (authHeader ? authHeader.replace(/^Bearer\s+/i, '').trim() : null) || queryKey;
+
+            transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => crypto.randomUUID(),
+                onsessioninitialized: (sid) => {
+                    activeTransports.set(sid, transport);
+                }
+            });
+
+            transport.onclose = () => {
+                const sid = transport.sessionId;
+                if (sid && activeTransports.has(sid)) {
+                    activeTransports.delete(sid);
+                }
+            };
+
+            const serverInstance = createMcpServerInstance(serviceKey);
+            await serverInstance.connect(transport);
+        } else {
+            return res.status(400).json({
+                jsonrpc: "2.0",
+                error: { code: -32000, message: "No valid session ID provided or server uninitialized." },
+                id: null
+            });
+        }
+
+        await transport.handleRequest(req, res, req.body);
+    } catch (err) {
+        console.error('[MCP Streamable] Request error:', err.message);
+        if (!res.headersSent) {
+            res.status(500).json({ error: err.message });
+        }
+    }
+};
+
+app.post('/sse', handleStreamableHttp);
+app.all('/mcp', handleStreamableHttp);
+
+// 2. LEGACY HTTP+SSE TRANSPORT (Claude Desktop, Cursor, Legacy Clients)
+app.get('/sse', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    const queryKey = req.query.key;
+    const serviceKey = (authHeader ? authHeader.replace(/^Bearer\s+/i, '').trim() : null) || queryKey;
+
+    const transport = new SSEServerTransport('/messages', res);
+    activeTransports.set(transport.sessionId, transport);
+
+    res.on('close', () => {
+        activeTransports.delete(transport.sessionId);
+        console.log(`[MCP SSE] Client disconnected: ${transport.sessionId}`);
+    });
+
+    const serverInstance = createMcpServerInstance(serviceKey);
+    await serverInstance.connect(transport);
+});
+
+const handlePostMessages = async (req, res) => {
+    const sessionId = req.query.sessionId;
+    const transport = activeTransports.get(sessionId);
+    if (!transport || !(transport instanceof SSEServerTransport)) {
+        return res.status(404).json({ error: "Session not found or expired." });
+    }
+    await transport.handlePostMessage(req, res, req.body);
+};
+
+app.post('/messages', handlePostMessages);
+app.post('/api/mcp/messages', handlePostMessages);
+
+const server = app.listen(PORT, () => {
+    console.log(`===========================================================`);
+    console.log(`  ⚡ AGENTPAY PAYMENT GATEWAY RUNNING ON PORT ${PORT}`);
+    console.log(`  • Default Agent Wallet: ${process.env.VOLTAGE_WALLET_ID}`);
+    console.log(`  • MCP Gateway Route:    http://localhost:${PORT}/api/gateway/pay`);
+    console.log(`  • Dashboard SSE:        http://localhost:${PORT}/api/stream`);
+    console.log(`===========================================================`);
+});
+
+server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`\n❌ [ERROR] Port ${PORT} is already in use by another process!`);
+        console.error(`👉 Run 'netstat -ano | findstr :${PORT}' or kill the background process using port ${PORT}.\n`);
+    } else {
+        console.error(`\n❌ [ERROR] Server error:`, err);
+    }
+});

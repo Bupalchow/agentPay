@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Play, Check, Copy, RefreshCw, Circle, ArrowRight, 
-  User, LogOut, Lock, Key, AlertCircle, Shield, Zap
+  User, LogOut, Lock, Key, AlertCircle, Shield, Zap, Trash2
 } from 'lucide-react';
 import { 
   auth, 
@@ -14,7 +14,8 @@ import {
   collection,
   doc,
   setDoc,
-  getDocs
+  getDocs,
+  deleteDoc
 } from './firebase';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000';
@@ -37,7 +38,7 @@ export default function App() {
   const [copied, setCopied] = useState(null);
 
   // ── Integration Page State ──
-  const [mcpClient, setMcpClient] = useState('claude'); // 'claude' | 'cursor' | 'python' | 'curl'
+  const [mcpClient, setMcpClient] = useState('antigravity'); // 'antigravity' | 'claude' | 'python' | 'curl'
   const [walletType, setWalletType] = useState('voltage'); // 'voltage' | 'nwc' | 'lnd'
   const [newKeyName, setNewKeyName] = useState('');
   
@@ -110,13 +111,8 @@ export default function App() {
         const fsAgents = [];
         snap.forEach((d) => fsAgents.push({ id: d.id, ...d.data() }));
         if (fsAgents.length > 0) {
-          setKeyList((prev) => {
-            if (prev.length === 0) {
-              setActiveKey(fsAgents[0]);
-              return fsAgents;
-            }
-            return prev;
-          });
+          setKeyList(fsAgents);
+          setActiveKey(fsAgents[0]);
         }
       } catch (fsErr) {
         console.warn("[AgentPay] Firestore read note:", fsErr.message);
@@ -322,10 +318,16 @@ export default function App() {
               agentName: newKeyName,
               walletType,
               serviceKey: d.key.serviceKey,
-              createdAt: new Date().toISOString()
+              walletConfig: walletConfig, // All Voltage orgId, envId, walletId, apiKey / NWC / LND config
+              network: walletType === 'nwc' ? 'NWC (Alby/Primal/Mutiny)' : walletType === 'lnd' ? 'LND Custom Node' : 'Voltage Cloud (Mutinynet)',
+              createdAt: new Date().toISOString(),
+              active: true
             });
           } catch (fsErr) {
             console.warn("[AgentPay] Firestore write note:", fsErr.message);
+            if (fsErr.message?.includes('permission') || fsErr.code === 'permission-denied') {
+              alert("Notice: Agent saved on Gateway, but your Firestore Rules blocked the write. Please add a rule for /users/{userId} in Firebase Console.");
+            }
           }
         }
 
@@ -351,26 +353,62 @@ export default function App() {
     }
   };
 
-  // ── Quick Test 402 Endpoint ──
+  // ── Delete Agent Credentials from Firestore & Gateway ──
+  const handleDeleteAgent = async (agentToDelete) => {
+    if (!agentToDelete || !user) return;
+    const confirmDelete = window.confirm(`Are you sure you want to delete '${agentToDelete.agentName}'? This will revoke the service key immediately.`);
+    if (!confirmDelete) return;
+
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetch(`${API_BASE}/api/keys/${agentToDelete.id}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${idToken}`
+        }
+      });
+      const d = await res.json();
+      if (d.success) {
+        if (db) {
+          try {
+            await deleteDoc(doc(db, "users", user.uid, "agents", agentToDelete.id));
+          } catch (e) {}
+        }
+        const updatedList = keyList.filter((k) => k.id !== agentToDelete.id);
+        setKeyList(updatedList);
+        if (activeKey?.id === agentToDelete.id) {
+          setActiveKey(updatedList.length > 0 ? updatedList[0] : null);
+        }
+      } else {
+        alert(d.error || 'Failed to delete agent.');
+      }
+    } catch (err) {
+      console.error('Error deleting agent:', err);
+      alert('Failed to delete agent: ' + err.message);
+    }
+  };
+
+  // ── Quick Test 402 Endpoint (Queries Independent Merchant on :3001) ──
   const handleTestEndpoint = async () => {
     setIsTestingEndpoint(true);
     setQuickTestResult(null);
 
+    const merchantUrl = 'http://localhost:3001/api/data';
     try {
-      const res = await fetch(`${API_BASE}/api/data`);
+      const res = await fetch(merchantUrl);
       const authHeader = res.headers.get('WWW-Authenticate') || '';
 
       setQuickTestResult({
         status: res.status,
         message: res.status === 402 
-          ? 'Endpoint correctly returned HTTP 402 with BOLT11 invoice and macaroon.' 
-          : 'Unexpected status code received.',
+          ? 'Merchant Server (:3001) correctly returned HTTP 402 with BOLT11 invoice and macaroon.' 
+          : 'Unexpected status code received from merchant.',
         authHeaderPreview: authHeader ? authHeader.slice(0, 70) + '...' : 'none'
       });
     } catch (err) {
       setQuickTestResult({
         status: 0,
-        message: `Could not connect to ${API_BASE}. Ensure proxy is running.`
+        message: `Could not connect to Merchant Server at ${merchantUrl}. Ensure 'node merchant.js' is running on port 3001.`
       });
     } finally {
       setIsTestingEndpoint(false);
@@ -437,7 +475,6 @@ export default function App() {
   };
 
   const currentKeyString = activeKey?.serviceKey || '<register-an-agent-to-generate-key>';
-  const serverPath = 'd:/helping others/agentPay/mcp.js';
 
   const getSnippet = () => {
     switch (mcpClient) {
@@ -446,28 +483,9 @@ export default function App() {
           {
             mcpServers: {
               "agentpay": {
-                command: "node",
-                args: [serverPath],
-                env: {
-                  AGENTPAY_SERVICE_KEY: currentKeyString,
-                  AGENTPAY_GATEWAY_URL: API_BASE
-                }
-              }
-            }
-          },
-          null,
-          2
-        );
-      case 'cursor':
-        return JSON.stringify(
-          {
-            mcpServers: {
-              "agentpay": {
-                command: "node",
-                args: [serverPath],
-                env: {
-                  AGENTPAY_SERVICE_KEY: currentKeyString,
-                  AGENTPAY_GATEWAY_URL: API_BASE
+                url: `${API_BASE}/sse`,
+                headers: {
+                  Authorization: `Bearer ${currentKeyString}`
                 }
               }
             }
@@ -476,15 +494,17 @@ export default function App() {
           2
         );
       case 'python':
-        return `# Python (LangChain / CrewAI / Smolagents)
-from langchain.agents import initialize_agent
+        return `# Python (LangChain / CrewAI / Smolagents / AutoGen)
+import requests
 
-# Call AgentPay tool directly when agent hits paywall:
-response = agent.run(
-    "Query restricted resource at ${API_BASE}/api/data "
-    "using tool 'fetch_with_l402'."
-)
-print(response)  # AgentPay gateway settles invoice via ${activeKey ? activeKey.agentName : 'your wallet'}`;
+# 1. Query paywalled resource
+response = requests.get("${API_BASE}/api/data")
+
+# 2. When HTTP 402 is returned, route payment through AgentPay Gateway:
+# POST ${API_BASE}/api/gateway/pay
+# Headers: {'Authorization': 'Bearer ${currentKeyString}'}
+# Body: {'invoice': invoice}
+print("Authenticated and unlocked via AgentPay Gateway")`;
       case 'curl':
         return `# 1. Query paywalled resource
 curl -i ${API_BASE}/api/data
@@ -498,8 +518,19 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
   -H "Authorization: Bearer ${currentKeyString}" \\
   -H "Content-Type: application/json" \\
   -d '{"invoice": "<invoice>"}'`;
+      case 'antigravity':
       default:
-        return '';
+        return JSON.stringify(
+          {
+            mcpServers: {
+              "agentpay": {
+                serverUrl: `${API_BASE}/sse?key=${currentKeyString}`
+              }
+            }
+          },
+          null,
+          2
+        );
     }
   };
 
@@ -894,22 +925,33 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                     </code>
                   </div>
 
-                  <button
-                    onClick={() => copyToClipboard(activeKey?.serviceKey, 'activeKey')}
-                    className="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-xs font-mono text-zinc-200 transition flex items-center gap-1.5 shrink-0"
-                  >
-                    {copied === 'activeKey' ? (
-                      <>
-                        <Check className="h-3 w-3 text-emerald-400" />
-                        <span>Copied</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="h-3 w-3" />
-                        <span>Copy Key</span>
-                      </>
-                    )}
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => copyToClipboard(activeKey?.serviceKey, 'activeKey')}
+                      className="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-xs font-mono text-zinc-200 transition flex items-center gap-1.5"
+                    >
+                      {copied === 'activeKey' ? (
+                        <>
+                          <Check className="h-3 w-3 text-emerald-400" />
+                          <span>Copied</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3 w-3" />
+                          <span>Copy Key</span>
+                        </>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={() => handleDeleteAgent(activeKey)}
+                      title="Delete Agent"
+                      className="px-2.5 py-1.5 rounded bg-red-950/40 hover:bg-red-900/60 border border-red-800/50 text-red-300 text-xs transition flex items-center gap-1.5"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      <span>Delete</span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Switch between saved agent wallets */}
@@ -918,17 +960,31 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                     <span className="text-[11px] font-mono text-zinc-500 uppercase block mb-1.5">Registered Agent Wallets:</span>
                     <div className="flex flex-wrap gap-2">
                       {keyList.map((k) => (
-                        <button
+                        <div
                           key={k.id}
-                          onClick={() => setActiveKey(k)}
-                          className={`px-2.5 py-1 rounded text-xs font-mono border transition ${
+                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-mono border transition ${
                             activeKey?.id === k.id
                               ? 'border-zinc-500 bg-zinc-800 text-white font-medium'
                               : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-zinc-200'
                           }`}
                         >
-                          {k.agentName} ({k.walletType})
-                        </button>
+                          <button
+                            onClick={() => setActiveKey(k)}
+                            className="hover:underline"
+                          >
+                            {k.agentName} ({k.walletType})
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDeleteAgent(k);
+                            }}
+                            title={`Delete ${k.agentName}`}
+                            className="text-zinc-500 hover:text-red-400 transition ml-1"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
                       ))}
                     </div>
                   </div>
@@ -949,18 +1005,23 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                 </p>
               </div>
 
-              <div className="flex items-center gap-1 bg-zinc-950 p-1 rounded border border-zinc-800 text-xs font-mono">
-                {['claude', 'cursor', 'python', 'curl'].map((client) => (
+              <div className="flex flex-wrap items-center gap-1 bg-zinc-950 p-1 rounded border border-zinc-800 text-xs font-mono">
+                {[
+                  { id: 'antigravity', label: 'Antigravity / Gemini IDE' },
+                  { id: 'claude', label: 'Claude Desktop / Cursor' },
+                  { id: 'python', label: 'Python SDK' },
+                  { id: 'curl', label: 'cURL / REST' }
+                ].map((item) => (
                   <button
-                    key={client}
-                    onClick={() => setMcpClient(client)}
-                    className={`px-2.5 py-1 rounded capitalize transition ${
-                      mcpClient === client
+                    key={item.id}
+                    onClick={() => setMcpClient(item.id)}
+                    className={`px-3 py-1.5 rounded transition ${
+                      mcpClient === item.id
                         ? 'bg-zinc-800 text-white font-medium'
                         : 'text-zinc-400 hover:text-zinc-200'
                     }`}
                   >
-                    {client === 'curl' ? 'cURL' : client}
+                    {item.label}
                   </button>
                 ))}
               </div>
@@ -1191,7 +1252,7 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                     {simStep >= 1 && <Check className="h-3.5 w-3.5 text-zinc-300" />}
                   </div>
                   <div className="text-[11px] text-zinc-400 mt-1">
-                    Agent queries restricted resource: <code>GET /api/data</code> (No Auth)
+                    Agent queries Merchant Site: <code>GET http://localhost:3001/api/data</code> (No Auth)
                   </div>
                 </div>
 
@@ -1201,11 +1262,11 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                   }`}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="font-semibold">2. Server 402 Challenge</span>
+                    <span className="font-semibold">2. Merchant 402 Challenge</span>
                     {simStep >= 2 && <Check className="h-3.5 w-3.5 text-amber-400" />}
                   </div>
                   <div className="text-[11px] text-zinc-400 mt-1">
-                    Proxy creates real 10 sat Mutinynet invoice on Voltage node & returns 402
+                    Merchant (:3001) returns HTTP 402 + 10 sat invoice to Receiver Wallet <code>21872d9d...</code>
                   </div>
                 </div>
 
@@ -1215,11 +1276,11 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                   }`}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="font-semibold">3. Voltage Wallet Settlement</span>
+                    <span className="font-semibold">3. AgentPay Gateway Settlement</span>
                     {simStep >= 3 && <Check className="h-3.5 w-3.5 text-amber-400" />}
                   </div>
                   <div className="text-[11px] text-zinc-400 mt-1">
-                    Voltage API posts payment & debits wallet ledger (-10 sats)
+                    AgentPay Gateway (:3000) debits 10 sats from Agent Wallet <code>137fa5a5...</code>
                   </div>
                 </div>
 
@@ -1229,11 +1290,11 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                   }`}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="font-semibold">4. Unlocked 200 OK</span>
+                    <span className="font-semibold">4. Merchant 200 OK Unlocked</span>
                     {simStep >= 4 && <Check className="h-3.5 w-3.5 text-emerald-400" />}
                   </div>
                   <div className="text-[11px] text-zinc-400 mt-1">
-                    Authorization: L402 token:preimage verified. Premium payload unlocked!
+                    Merchant (:3001) verifies preimage & unlocked payload via L402
                   </div>
                 </div>
               </div>
