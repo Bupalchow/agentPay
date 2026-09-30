@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Play, Check, Copy, RefreshCw, Circle, ArrowRight, 
-  User, LogOut, Lock, Key, AlertCircle, Shield, Zap, Trash2
+  User, LogOut, Lock, Key, AlertCircle, Shield, Zap, Trash2,
+  Sliders, RotateCcw
 } from 'lucide-react';
 import { 
   auth, 
@@ -31,7 +32,7 @@ export default function App() {
   const [authSubmitting, setAuthSubmitting] = useState(false);
 
   // ── Navigation (2 Pages, protected) ──
-  const [currentPage, setCurrentPage] = useState('integration'); // 'integration' | 'simulation'
+  const [currentPage, setCurrentPage] = useState('integration'); // 'integration' | 'activity'
 
   // ── Shared SSE & UI State ──
   const [connectionStatus, setConnectionStatus] = useState('connecting');
@@ -50,6 +51,11 @@ export default function App() {
   const [nwcUri, setNwcUri] = useState('');
   const [lndRestUrl, setLndRestUrl] = useState('');
   const [lndMacaroon, setLndMacaroon] = useState('');
+  const [spendLimit, setSpendLimit] = useState(500); // Default spend limit 500 sats (0 = unlimited)
+  const [isEditingLimit, setIsEditingLimit] = useState(false);
+  const [editLimitInput, setEditLimitInput] = useState(500);
+  const [isSavingLimit, setIsSavingLimit] = useState(false);
+  const [isRefreshingSpend, setIsRefreshingSpend] = useState(false);
 
   const [keyList, setKeyList] = useState([]);
   const [activeKey, setActiveKey] = useState(null);
@@ -58,17 +64,12 @@ export default function App() {
   const [quickTestResult, setQuickTestResult] = useState(null);
   const [isTestingEndpoint, setIsTestingEndpoint] = useState(false);
 
-  // ── Simulation Page State ──
+  // ── Live Activity Page State ──
   const [totalSats, setTotalSats] = useState(0);
   const [settledCount, setSettledCount] = useState(0);
   const [activeSessions, setActiveSessions] = useState(0);
   const [status, setStatus] = useState('idle'); // 'idle' | 'pending' | 'verified'
   const [events, setEvents] = useState([]);
-  const [isSimulating, setIsSimulating] = useState(false);
-  const [simStep, setSimStep] = useState(0); // 0: idle, 1: req, 2: 402, 3: paying, 4: done
-  const [simData, setSimData] = useState(null);
-  const [simDetails, setSimDetails] = useState(null);
-  const [simError, setSimError] = useState(null);
   const [walletHistory, setWalletHistory] = useState([]);
   const [walletId, setWalletId] = useState(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
@@ -95,7 +96,13 @@ export default function App() {
       if (d.success && Array.isArray(d.keys)) {
         setKeyList(d.keys);
         if (d.keys.length > 0) {
-          setActiveKey(d.keys[0]);
+          setActiveKey((prev) => {
+            if (prev) {
+              const matched = d.keys.find((k) => k.id === prev.id || k.serviceKey === prev.serviceKey);
+              if (matched) return matched;
+            }
+            return d.keys[0];
+          });
         } else {
           setActiveKey(null);
         }
@@ -112,11 +119,30 @@ export default function App() {
         snap.forEach((d) => fsAgents.push({ id: d.id, ...d.data() }));
         if (fsAgents.length > 0) {
           setKeyList(fsAgents);
-          setActiveKey(fsAgents[0]);
+          setActiveKey((prev) => {
+            if (prev) {
+              const matched = fsAgents.find((k) => k.id === prev.id || k.serviceKey === prev.serviceKey);
+              if (matched) return matched;
+            }
+            return fsAgents[0];
+          });
         }
       } catch (fsErr) {
         console.warn("[AgentPay] Firestore read note:", fsErr.message);
       }
+    }
+  };
+
+  // ── One-Click Quick Refresh Spend Counter & Agent Limits ──
+  const handleRefreshSpend = async () => {
+    if (!user) return;
+    setIsRefreshingSpend(true);
+    try {
+      await loadUserAgents(user);
+    } catch (err) {
+      console.error("[AgentPay] Failed to refresh spend:", err);
+    } finally {
+      setTimeout(() => setIsRefreshingSpend(false), 450);
     }
   };
 
@@ -201,6 +227,26 @@ export default function App() {
       }
     });
 
+    es.addEventListener('spend_updated', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        setKeyList((prev) => prev.map((k) => {
+          if (k.id === data.agentId || k.serviceKey === data.serviceKey) {
+            return { ...k, totalSpentSats: data.totalSpentSats, spendLimit: data.spendLimit };
+          }
+          return k;
+        }));
+        setActiveKey((prev) => {
+          if (prev && (prev.id === data.agentId || prev.serviceKey === data.serviceKey)) {
+            return { ...prev, totalSpentSats: data.totalSpentSats, spendLimit: data.spendLimit };
+          }
+          return prev;
+        });
+      } catch (err) {
+        console.error('[SSE] Error handling spend_updated:', err);
+      }
+    });
+
     return () => {
       es.close();
       if (statusTimer.current) clearTimeout(statusTimer.current);
@@ -213,11 +259,12 @@ export default function App() {
     setTimeout(() => setCopied(null), 1600);
   };
 
-  // ── Fetch Live Wallet Ledger & Transactions from Voltage Node ──
-  const fetchWalletHistory = async () => {
+  // ── Fetch Live Wallet Ledger & Transactions from Node / NWC ──
+  const fetchWalletHistory = async (targetKey = activeKey) => {
     setIsLoadingHistory(true);
     try {
-      const res = await fetch(`${API_BASE}/api/wallet/recent-payments`);
+      const keyParam = targetKey?.serviceKey ? `?key=${encodeURIComponent(targetKey.serviceKey)}` : '';
+      const res = await fetch(`${API_BASE}/api/wallet/recent-payments${keyParam}`);
       const data = await res.json();
       if (data.success) {
         setWalletHistory(data.items || []);
@@ -230,12 +277,12 @@ export default function App() {
     }
   };
 
-  // Load wallet history on auth or when switching to simulation tab
+  // Load wallet history on auth, tab switch, or when active agent changes
   useEffect(() => {
-    if (user && currentPage === 'simulation') {
-      fetchWalletHistory();
+    if (user && currentPage === 'activity') {
+      fetchWalletHistory(activeKey);
     }
-  }, [user, currentPage]);
+  }, [user, currentPage, activeKey?.id]);
 
   // ── Handle Firebase Auth Form Submit ──
   const handleAuthSubmit = async (e) => {
@@ -296,6 +343,7 @@ export default function App() {
 
     try {
       const idToken = await user.getIdToken();
+      const parsedLimit = Number(spendLimit) >= 0 ? Number(spendLimit) : 500;
       const res = await fetch(`${API_BASE}/api/keys`, {
         method: 'POST',
         headers: { 
@@ -305,7 +353,8 @@ export default function App() {
         body: JSON.stringify({ 
           agentName: newKeyName, 
           walletType, 
-          walletConfig 
+          walletConfig,
+          spendLimit: parsedLimit
         })
       });
 
@@ -318,6 +367,8 @@ export default function App() {
               agentName: newKeyName,
               walletType,
               serviceKey: d.key.serviceKey,
+              spendLimit: parsedLimit,
+              totalSpentSats: 0,
               walletConfig: walletConfig, // All Voltage orgId, envId, walletId, apiKey / NWC / LND config
               network: walletType === 'nwc' ? 'NWC (Alby/Primal/Mutiny)' : walletType === 'lnd' ? 'LND Custom Node' : 'Voltage Cloud (Mutinynet)',
               createdAt: new Date().toISOString(),
@@ -334,6 +385,7 @@ export default function App() {
         setKeyList((prev) => [d.key, ...prev]);
         setActiveKey(d.key);
         setNewKeyName('');
+        setSpendLimit(500);
         setVoltageApiKey('');
         setVoltageOrgId('');
         setVoltageEnvId('');
@@ -350,6 +402,59 @@ export default function App() {
       alert('Error registering wallet: ' + err.message);
     } finally {
       setIsSavingKey(false);
+    }
+  };
+
+  // ── Update Agent Spend Limit / Reset Spent Counter ──
+  const handleUpdateSpendLimit = async (agentId, newLimit, resetSpent = false) => {
+    if (!agentId || !user) return;
+    setIsSavingLimit(true);
+
+    const numericLimit = Number(newLimit);
+    const validLimit = !isNaN(numericLimit) && numericLimit >= 0 ? numericLimit : 0;
+
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetch(`${API_BASE}/api/keys/${agentId}`, {
+        method: 'PATCH',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`
+        },
+        body: JSON.stringify({ 
+          spendLimit: validLimit, 
+          resetSpent 
+        })
+      });
+
+      const d = await res.json();
+      if (d.success && d.key) {
+        // Sync to Firestore
+        if (db) {
+          try {
+            const updates = { 
+              spendLimit: validLimit,
+              ...(resetSpent ? { totalSpentSats: 0 } : {})
+            };
+            await setDoc(doc(db, "users", user.uid, "agents", agentId), updates, { merge: true });
+          } catch (fsErr) {
+            console.warn("[AgentPay] Firestore spend update note:", fsErr.message);
+          }
+        }
+
+        setKeyList((prev) => prev.map((k) => (k.id === agentId ? { ...k, ...d.key } : k)));
+        if (activeKey?.id === agentId) {
+          setActiveKey((prev) => ({ ...prev, ...d.key }));
+        }
+        setIsEditingLimit(false);
+      } else {
+        alert(d.error || 'Failed to update spend limit.');
+      }
+    } catch (err) {
+      console.error('Failed to update spend limit:', err);
+      alert('Error updating spend limit: ' + err.message);
+    } finally {
+      setIsSavingLimit(false);
     }
   };
 
@@ -412,65 +517,6 @@ export default function App() {
       });
     } finally {
       setIsTestingEndpoint(false);
-    }
-  };
-
-  // ── Run End-to-End Simulation (Real Lightning Payment on Voltage) ──
-  const runSimulation = async () => {
-    if (isSimulating) return;
-    setIsSimulating(true);
-    setSimStep(1);
-    setSimData(null);
-    setSimDetails(null);
-    setSimError(null);
-
-    const targetAgentName = activeKey?.agentName || 'Voltage Mutinynet Agent';
-    const targetServiceKey = activeKey?.serviceKey || null;
-    const targetAgentId = activeKey?.id || null;
-
-    try {
-      await new Promise((r) => setTimeout(r, 350));
-      setSimStep(2);
-
-      const res = await fetch(`${API_BASE}/api/simulate-agent`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          agentName: targetAgentName,
-          serviceKey: targetServiceKey,
-          agentId: targetAgentId
-        })
-      });
-      const data = await res.json();
-
-      if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Real Lightning payment execution failed on Voltage.');
-      }
-
-      setSimStep(3);
-      await new Promise((r) => setTimeout(r, 450));
-
-      setSimStep(4);
-      setSimData(data.data);
-      setSimDetails({
-        invoice: data.invoice,
-        paymentHash: data.paymentHash,
-        preimage: data.preimage,
-        amount: data.amount || 10,
-        settlement: data.settlement,
-        network: data.network || 'Mutinynet Signet',
-        voltageDetails: data.voltageDetails || null,
-        agent: data.agent
-      });
-
-      // Automatically refresh wallet payments ledger from Voltage to show the new outflow!
-      await fetchWalletHistory();
-    } catch (err) {
-      console.error('Simulation failed:', err);
-      setSimError(err.message);
-      setSimStep(0);
-    } finally {
-      setIsSimulating(false);
     }
   };
 
@@ -676,14 +722,14 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
               Integration
             </button>
             <button
-              onClick={() => setCurrentPage('simulation')}
+              onClick={() => setCurrentPage('activity')}
               className={`px-3 py-1.5 rounded transition ${
-                currentPage === 'simulation'
+                currentPage === 'activity'
                   ? 'bg-zinc-700 text-white font-semibold'
                   : 'text-zinc-400 hover:text-zinc-200'
               }`}
             >
-              Simulation
+              Live Activity
             </button>
           </nav>
 
@@ -870,6 +916,56 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                   </div>
                 )}
 
+                {/* Autonomous Spend Limit Configuration */}
+                <div className="p-3 rounded bg-zinc-900/80 border border-zinc-800 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[11px] font-mono text-zinc-300 font-semibold block">
+                      Autonomous Spend Limit (Satoshis)
+                    </label>
+                    <span className="text-[10px] font-mono text-zinc-400">
+                      Gateway blocks payments (HTTP 403) when budget is exceeded
+                    </span>
+                  </div>
+                  
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="number"
+                      min="0"
+                      step="10"
+                      value={spendLimit}
+                      onChange={(e) => setSpendLimit(e.target.value)}
+                      placeholder="e.g. 500"
+                      className="w-36 bg-zinc-950 border border-zinc-700 rounded px-2.5 py-1.5 font-mono text-xs text-zinc-200 focus:outline-none focus:border-amber-400"
+                      required
+                    />
+                    <span className="text-xs font-mono text-zinc-400">sats</span>
+
+                    {/* Presets */}
+                    <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-mono ml-auto">
+                      {[
+                        { label: '100 sats', val: 100 },
+                        { label: '500 sats', val: 500 },
+                        { label: '1,000 sats', val: 1000 },
+                        { label: '5,000 sats', val: 5000 },
+                        { label: 'Unlimited (0)', val: 0 }
+                      ].map((preset) => (
+                        <button
+                          key={preset.val}
+                          type="button"
+                          onClick={() => setSpendLimit(preset.val)}
+                          className={`px-2 py-1 rounded border transition ${
+                            Number(spendLimit) === preset.val
+                              ? 'bg-amber-400 text-black border-amber-300 font-semibold'
+                              : 'bg-zinc-950 border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                          }`}
+                        >
+                          {preset.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
                 <div className="flex justify-end pt-1">
                   <button
                     type="submit"
@@ -954,6 +1050,164 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                   </div>
                 </div>
 
+                {/* ── Autonomous Spend Limit & Budget Meter ── */}
+                <div className="p-3.5 rounded bg-zinc-950 border border-zinc-800 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <Sliders className="h-3.5 w-3.5 text-amber-400" />
+                      <span className="text-xs font-semibold text-white">Autonomous Spend Limit</span>
+                      <span className={`text-[10px] font-mono px-2 py-0.5 rounded font-medium border ${
+                        activeKey?.spendLimit > 0 && (activeKey?.totalSpentSats || 0) >= activeKey?.spendLimit
+                          ? 'bg-red-950/80 text-red-400 border-red-800/60'
+                          : activeKey?.spendLimit > 0
+                          ? 'bg-emerald-950/80 text-emerald-400 border-emerald-800/60'
+                          : 'bg-zinc-900 text-zinc-400 border-zinc-700'
+                      }`}>
+                        {activeKey?.spendLimit > 0 && (activeKey?.totalSpentSats || 0) >= activeKey?.spendLimit
+                          ? 'LIMIT REACHED (PAYMENTS BLOCKED)'
+                          : activeKey?.spendLimit > 0
+                          ? 'BUDGET ACTIVE'
+                          : 'UNLIMITED SPEND'}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={handleRefreshSpend}
+                        disabled={isRefreshingSpend}
+                        title="Refresh latest spend from wallet & database"
+                        className="px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-[11px] font-mono transition flex items-center gap-1"
+                      >
+                        <RefreshCw className={`h-3 w-3 ${isRefreshingSpend ? 'animate-spin text-amber-400' : 'text-zinc-400'}`} />
+                        <span>{isRefreshingSpend ? 'Syncing...' : 'Refresh'}</span>
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          setEditLimitInput(activeKey?.spendLimit ?? 500);
+                          setIsEditingLimit(!isEditingLimit);
+                        }}
+                        className="px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-[11px] font-mono transition flex items-center gap-1"
+                      >
+                        <Sliders className="h-3 w-3" />
+                        <span>{isEditingLimit ? 'Close' : 'Adjust Limit'}</span>
+                      </button>
+
+                      {(activeKey?.totalSpentSats || 0) > 0 && (
+                        <button
+                          onClick={() => {
+                            if (window.confirm(`Reset spend counter for ${activeKey?.agentName} back to 0 sats?`)) {
+                              handleUpdateSpendLimit(activeKey.id, activeKey.spendLimit ?? 500, true);
+                            }
+                          }}
+                          disabled={isSavingLimit}
+                          title="Reset spent sats counter back to 0"
+                          className="px-2.5 py-1 rounded bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-300 text-[11px] font-mono transition flex items-center gap-1"
+                        >
+                          <RotateCcw className="h-3 w-3" />
+                          <span>Reset Spent</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Inline Limit Editor */}
+                  {isEditingLimit && (
+                    <div className="p-3 rounded bg-zinc-900 border border-zinc-700 space-y-2.5">
+                      <div className="text-[11px] font-mono text-zinc-300">
+                        Set Max Budget in Satoshis (Enter 0 for Unlimited):
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          type="number"
+                          min="0"
+                          step="10"
+                          value={editLimitInput}
+                          onChange={(e) => setEditLimitInput(e.target.value)}
+                          className="w-32 bg-zinc-950 border border-zinc-700 rounded px-2.5 py-1 font-mono text-xs text-white focus:outline-none focus:border-amber-400"
+                        />
+                        <span className="text-xs font-mono text-zinc-400">sats</span>
+
+                        {/* Quick Presets */}
+                        <div className="flex flex-wrap items-center gap-1 text-[10px] font-mono">
+                          {[100, 500, 1000, 5000, 0].map((preset) => (
+                            <button
+                              key={preset}
+                              type="button"
+                              onClick={() => setEditLimitInput(preset)}
+                              className={`px-2 py-0.5 rounded border transition ${
+                                Number(editLimitInput) === preset
+                                  ? 'bg-amber-400 text-black border-amber-300 font-semibold'
+                                  : 'bg-zinc-950 hover:bg-zinc-800 border-zinc-700 text-zinc-300'
+                              }`}
+                            >
+                              {preset === 0 ? 'Unlimited' : `${preset.toLocaleString()} sats`}
+                            </button>
+                          ))}
+                        </div>
+
+                        <button
+                          type="button"
+                          disabled={isSavingLimit}
+                          onClick={() => handleUpdateSpendLimit(activeKey.id, editLimitInput, false)}
+                          className="ml-auto px-3 py-1 rounded bg-amber-400 hover:bg-amber-300 text-black font-semibold text-xs font-mono transition flex items-center gap-1.5"
+                        >
+                          {isSavingLimit ? (
+                            <>
+                              <RefreshCw className="h-3 w-3 animate-spin" />
+                              <span>Saving...</span>
+                            </>
+                          ) : (
+                            <span>Save Limit</span>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Budget Metrics & Progress Bar */}
+                  <div className="space-y-1.5 pt-1">
+                    <div className="flex items-center justify-between text-xs font-mono">
+                      <div>
+                        <span className="text-zinc-400">Spent: </span>
+                        <span className="text-white font-semibold">{(activeKey?.totalSpentSats || 0).toLocaleString()} sats</span>
+                        <span className="text-zinc-500"> / </span>
+                        <span className="text-zinc-300 font-semibold">
+                          {activeKey?.spendLimit > 0 ? `${activeKey.spendLimit.toLocaleString()} sats` : 'Unlimited'}
+                        </span>
+                      </div>
+                      <div className="text-zinc-400 text-[11px]">
+                        {activeKey?.spendLimit > 0 ? (
+                          <span>
+                            Remaining: <span className="text-white font-semibold">{Math.max(0, activeKey.spendLimit - (activeKey.totalSpentSats || 0)).toLocaleString()} sats</span>
+                          </span>
+                        ) : (
+                          <span className="text-zinc-500">No cap enforced</span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Progress Bar (Only when spendLimit > 0) */}
+                    {activeKey?.spendLimit > 0 && (
+                      <div className="w-full h-2 rounded-full bg-zinc-900 border border-zinc-800 overflow-hidden">
+                        <div
+                          className={`h-full transition-all duration-500 ${
+                            (activeKey?.totalSpentSats || 0) >= activeKey?.spendLimit
+                              ? 'bg-red-500'
+                              : ((activeKey?.totalSpentSats || 0) / activeKey?.spendLimit) >= 0.75
+                              ? 'bg-amber-400'
+                              : 'bg-emerald-500'
+                          }`}
+                          style={{
+                            width: `${Math.min(100, Math.round(((activeKey?.totalSpentSats || 0) / activeKey?.spendLimit) * 100))}%`
+                          }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+
                 {/* Switch between saved agent wallets */}
                 {keyList.length > 1 && (
                   <div className="text-xs">
@@ -969,10 +1223,21 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                           }`}
                         >
                           <button
-                            onClick={() => setActiveKey(k)}
-                            className="hover:underline"
+                            onClick={() => {
+                              setActiveKey(k);
+                              setEditLimitInput(k.spendLimit ?? 500);
+                            }}
+                            className="hover:underline flex items-center gap-1.5"
                           >
-                            {k.agentName} ({k.walletType})
+                            <span>{k.agentName}</span>
+                            <span className="text-[10px] text-zinc-500">({k.walletType})</span>
+                            <span className={`text-[10px] px-1 py-0.2 rounded font-mono ${
+                              k.spendLimit > 0 && (k.totalSpentSats || 0) >= k.spendLimit
+                                ? 'bg-red-950 text-red-400'
+                                : 'bg-zinc-900 text-zinc-400'
+                            }`}>
+                              {(k.totalSpentSats || 0)}/{k.spendLimit > 0 ? k.spendLimit : '∞'}
+                            </span>
                           </button>
                           <button
                             onClick={(e) => {
@@ -1115,10 +1380,10 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                 </button>
 
                 <button
-                  onClick={() => setCurrentPage('simulation')}
+                  onClick={() => setCurrentPage('activity')}
                   className="px-3 py-1.5 rounded bg-white text-black hover:bg-zinc-200 text-xs font-medium transition flex items-center gap-1.5"
                 >
-                  <span>Go to Simulation</span>
+                  <span>Go to Live Activity</span>
                   <ArrowRight className="h-3 w-3" />
                 </button>
               </div>
@@ -1142,9 +1407,9 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
       )}
 
       {/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-          PAGE 2: SIMULATION (DEMO & LIVE SSE STREAM)
+          PAGE 2: LIVE ACTIVITY (CLEAN WALLET LEDGER)
          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
-      {currentPage === 'simulation' && (
+      {currentPage === 'activity' && (
         <main className="space-y-6">
 
           {/* Top Metric Cards */}
@@ -1152,7 +1417,7 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
             <div className="p-3.5 rounded-lg bg-zinc-900/60 border border-zinc-800">
               <div className="text-[11px] font-mono text-zinc-500 uppercase">Satoshis Settled</div>
               <div className="text-xl font-bold font-mono text-white mt-1">
-                {totalSats} <span className="text-xs font-normal text-zinc-500">sats</span>
+                {totalSats.toLocaleString()} <span className="text-xs font-normal text-zinc-500">sats</span>
               </div>
             </div>
 
@@ -1162,346 +1427,103 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
             </div>
 
             <div className="p-3.5 rounded-lg bg-zinc-900/60 border border-zinc-800">
-              <div className="text-[11px] font-mono text-zinc-500 uppercase">Active Wallet</div>
+              <div className="text-[11px] font-mono text-zinc-500 uppercase">Active Agent</div>
               <div className="text-sm font-semibold font-mono text-zinc-200 mt-1.5 truncate">
-                {activeKey ? `${activeKey.agentName} (${activeKey.walletType})` : 'None Connected'}
+                {activeKey ? activeKey.agentName : 'None Selected'}
+              </div>
+              <div className="text-[10px] font-mono text-zinc-500 mt-0.5">
+                {activeKey?.walletType === 'nwc' ? 'NWC (Nostr)' : activeKey?.walletType === 'lnd' ? 'Custom LND' : 'Voltage Cloud'}
               </div>
             </div>
 
             <div className="p-3.5 rounded-lg bg-zinc-900/60 border border-zinc-800">
-              <div className="text-[11px] font-mono text-zinc-500 uppercase">Protocol State</div>
-              <div className="mt-1.5 flex items-center gap-1.5 text-xs font-mono font-medium">
-                {status === 'pending' ? (
-                  <span className="text-amber-400 flex items-center gap-1.5">
-                    <Circle className="h-2 w-2 fill-amber-400 text-amber-400 animate-ping" />
-                    402 Challenge Issued
-                  </span>
-                ) : status === 'verified' ? (
-                  <span className="text-emerald-400 flex items-center gap-1.5">
-                    <Circle className="h-2 w-2 fill-emerald-400 text-emerald-400" />
-                    Settled & Unlocked
-                  </span>
+              <div className="text-[11px] font-mono text-zinc-500 uppercase">Spend vs Budget</div>
+              <div className="text-sm font-bold font-mono text-white mt-1.5 truncate">
+                {(activeKey?.totalSpentSats || 0).toLocaleString()} <span className="text-zinc-500 font-normal">/ {activeKey?.spendLimit > 0 ? `${activeKey.spendLimit.toLocaleString()} sats` : 'Unlimited'}</span>
+              </div>
+              <div className="text-[10px] font-mono text-emerald-400 mt-0.5">
+                {activeKey?.spendLimit > 0 && (activeKey?.totalSpentSats || 0) >= activeKey?.spendLimit ? (
+                  <span className="text-red-400">Limit Exhausted</span>
                 ) : (
-                  <span className="text-zinc-500 flex items-center gap-1.5">
-                    <Circle className="h-2 w-2 fill-zinc-600 text-zinc-600" />
-                    Ready
-                  </span>
+                  <span>Budget Active</span>
                 )}
               </div>
             </div>
           </section>
 
-          {/* Stepper + SSE Feed */}
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-
-            {/* Left: Simulation Runner */}
-            <section className="lg:col-span-6 bg-zinc-900/60 border border-zinc-800 rounded-lg p-5 space-y-4">
-              <div className="flex items-center justify-between pb-3 border-b border-zinc-800/80">
-                <div>
-                  <h2 className="text-sm font-semibold text-white flex items-center gap-1.5">
-                    <Zap className="h-3.5 w-3.5 text-emerald-400 fill-current" />
-                    <span>Real Lightning Payment Simulation</span>
-                  </h2>
-                  <p className="text-xs text-zinc-400 mt-0.5">
-                    {activeKey ? `Executes live 10-sat Mutinynet payment via ${activeKey.agentName}` : 'Executes live 10-sat Mutinynet payment via connected Voltage node'}
-                  </p>
-                </div>
-
-                <button
-                  onClick={runSimulation}
-                  disabled={isSimulating}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition ${
-                    isSimulating
-                      ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed'
-                      : 'bg-emerald-500 text-black hover:bg-emerald-400 font-semibold'
-                  }`}
-                >
-                  {isSimulating ? (
-                    <>
-                      <RefreshCw className="h-3 w-3 animate-spin" />
-                      <span>Executing Real Payment...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Zap className="h-3 w-3 fill-current" />
-                      <span>Execute Real Payment</span>
-                    </>
-                  )}
-                </button>
-              </div>
-
-              {simError && (
-                <div className="p-3 rounded bg-red-950/40 border border-red-800/80 text-xs font-mono text-red-300 flex items-start gap-2">
-                  <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-                  <div>
-                    <div className="font-semibold text-red-200">Payment Failed on Voltage</div>
-                    <div className="text-[11px] text-red-300/80 mt-0.5">{simError}</div>
-                  </div>
-                </div>
-              )}
-
-              {/* Protocol Step Sequence */}
-              <div className="space-y-2 text-xs font-mono">
-                <div
-                  className={`p-3 rounded border transition ${
-                    simStep >= 1 ? 'border-zinc-700 bg-zinc-900 text-zinc-100' : 'border-zinc-800/70 bg-zinc-950/40 text-zinc-500'
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-semibold">1. Agent Request</span>
-                    {simStep >= 1 && <Check className="h-3.5 w-3.5 text-zinc-300" />}
-                  </div>
-                  <div className="text-[11px] text-zinc-400 mt-1">
-                    Agent queries Merchant Site: <code>GET http://localhost:3001/api/data</code> (No Auth)
-                  </div>
-                </div>
-
-                <div
-                  className={`p-3 rounded border transition ${
-                    simStep >= 2 ? 'border-amber-900/80 bg-amber-950/20 text-amber-200' : 'border-zinc-800/70 bg-zinc-950/40 text-zinc-500'
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-semibold">2. Merchant 402 Challenge</span>
-                    {simStep >= 2 && <Check className="h-3.5 w-3.5 text-amber-400" />}
-                  </div>
-                  <div className="text-[11px] text-zinc-400 mt-1">
-                    Merchant (:3001) returns HTTP 402 + 10 sat invoice to Receiver Wallet <code>21872d9d...</code>
-                  </div>
-                </div>
-
-                <div
-                  className={`p-3 rounded border transition ${
-                    simStep >= 3 ? 'border-amber-800 bg-amber-950/30 text-amber-200' : 'border-zinc-800/70 bg-zinc-950/40 text-zinc-500'
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-semibold">3. AgentPay Gateway Settlement</span>
-                    {simStep >= 3 && <Check className="h-3.5 w-3.5 text-amber-400" />}
-                  </div>
-                  <div className="text-[11px] text-zinc-400 mt-1">
-                    AgentPay Gateway (:3000) debits 10 sats from Agent Wallet <code>137fa5a5...</code>
-                  </div>
-                </div>
-
-                <div
-                  className={`p-3 rounded border transition ${
-                    simStep >= 4 ? 'border-emerald-800 bg-emerald-950/20 text-emerald-200' : 'border-zinc-800/70 bg-zinc-950/40 text-zinc-500'
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-semibold">4. Merchant 200 OK Unlocked</span>
-                    {simStep >= 4 && <Check className="h-3.5 w-3.5 text-emerald-400" />}
-                  </div>
-                  <div className="text-[11px] text-zinc-400 mt-1">
-                    Merchant (:3001) verifies preimage & unlocked payload via L402
-                  </div>
-                </div>
-              </div>
-
-              {/* Real Lightning Settlement Receipt */}
-              {simDetails && (
-                <div className="p-4 rounded-lg bg-zinc-950 border border-emerald-800/70 text-xs font-mono space-y-3">
-                  <div className="flex items-center justify-between pb-2 border-b border-zinc-800/80">
-                    <div className="flex items-center gap-2">
-                      <span className="flex h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-                      <span className="text-xs font-semibold text-emerald-400 uppercase tracking-wide">
-                        Real Lightning Settlement Verified
-                      </span>
-                    </div>
-                    <span className="text-[11px] px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800/80 font-bold">
-                      -10 SATS OUTFLOW
-                    </span>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 text-[11px]">
-                    <div className="p-2 rounded bg-zinc-900/60 border border-zinc-800">
-                      <span className="text-zinc-500 block text-[10px] uppercase">Network & Node</span>
-                      <span className="text-zinc-200 font-medium">Mutinynet Signet (Voltage Cloud)</span>
-                    </div>
-                    <div className="p-2 rounded bg-zinc-900/60 border border-zinc-800">
-                      <span className="text-zinc-500 block text-[10px] uppercase">Paying Agent</span>
-                      <span className="text-zinc-200 font-medium">{simDetails.agent || 'Connected Wallet'}</span>
-                    </div>
-                  </div>
-
-                  {simDetails.voltageDetails && (
-                    <div className="p-2.5 rounded bg-zinc-900/40 border border-zinc-800/70 text-[11px] space-y-1">
-                      <div className="flex items-center justify-between text-zinc-400">
-                        <span>Voltage Payment ID:</span>
-                        <span className="text-zinc-300 font-mono text-[10px] select-all">
-                          {simDetails.voltageDetails.paymentId}
-                        </span>
-                      </div>
-                      {simDetails.voltageDetails.ledgerId && (
-                        <div className="flex items-center justify-between text-zinc-400">
-                          <span>Ledger Debit ID:</span>
-                          <span className="text-zinc-300 font-mono text-[10px] select-all">
-                            {simDetails.voltageDetails.ledgerId}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Cryptographic Preimage Proof */}
-                  <div className="p-2.5 rounded bg-zinc-900/80 border border-zinc-800 space-y-1">
-                    <div className="flex items-center justify-between text-[10px] text-zinc-400 uppercase tracking-wider">
-                      <span>Settlement Preimage (Cryptographic Proof)</span>
-                      <button
-                        onClick={() => copyToClipboard(simDetails.preimage, 'preimage')}
-                        className="text-zinc-400 hover:text-white"
-                      >
-                        {copied === 'preimage' ? 'Copied!' : 'Copy'}
-                      </button>
-                    </div>
-                    <div className="text-[11px] text-emerald-300 break-all select-all font-mono">
-                      {simDetails.preimage}
-                    </div>
-                  </div>
-
-                  {/* Payment Hash */}
-                  <div className="p-2.5 rounded bg-zinc-900/80 border border-zinc-800 space-y-1">
-                    <div className="flex items-center justify-between text-[10px] text-zinc-400 uppercase tracking-wider">
-                      <span>Payment Hash (R-Hash)</span>
-                      <button
-                        onClick={() => copyToClipboard(simDetails.paymentHash, 'simHash')}
-                        className="text-zinc-400 hover:text-white"
-                      >
-                        {copied === 'simHash' ? 'Copied!' : 'Copy'}
-                      </button>
-                    </div>
-                    <div className="text-[11px] text-zinc-300 break-all select-all font-mono">
-                      {simDetails.paymentHash}
-                    </div>
-                  </div>
-
-                  {/* BOLT11 Invoice */}
-                  <div className="p-2.5 rounded bg-zinc-900/80 border border-zinc-800 space-y-1">
-                    <div className="flex items-center justify-between text-[10px] text-zinc-400 uppercase tracking-wider">
-                      <span>BOLT11 Invoice</span>
-                      <button
-                        onClick={() => copyToClipboard(simDetails.invoice, 'simInv')}
-                        className="text-zinc-400 hover:text-white"
-                      >
-                        {copied === 'simInv' ? 'Copied!' : 'Copy'}
-                      </button>
-                    </div>
-                    <div className="text-[11px] text-zinc-400 break-all font-mono line-clamp-2 hover:line-clamp-none transition">
-                      {simDetails.invoice}
-                    </div>
-                  </div>
-
-                  <div className="pt-2 border-t border-zinc-800/80 text-[11px] text-zinc-400 flex items-center justify-between">
-                    <span>Actual balance outflow confirmed on Voltage.</span>
-                    <span className="text-emerald-400 font-semibold">Wallet Ledger Updated</span>
-                  </div>
-                </div>
-              )}
-
-              {simData && (
-                <div className="p-3 rounded bg-zinc-950 border border-zinc-800 text-xs font-mono space-y-1.5">
-                  <div className="text-[11px] text-emerald-400 font-semibold flex items-center justify-between">
-                    <span>Unlocked Payload:</span>
-                    <span className="text-zinc-500 font-normal">HTTP 200 OK</span>
-                  </div>
-                  <pre className="text-[11px] text-zinc-300 leading-relaxed overflow-x-auto">
-                    {JSON.stringify(simData, null, 2)}
-                  </pre>
-                </div>
-              )}
-            </section>
-
-            {/* Right: Live SSE Stream */}
-            <section className="lg:col-span-6 bg-zinc-900/60 border border-zinc-800 rounded-lg p-5 flex flex-col min-h-[460px]">
-              <div className="flex items-center justify-between pb-3 border-b border-zinc-800/80">
-                <div>
-                  <h2 className="text-sm font-semibold text-white">Live Event Stream</h2>
-                  <p className="text-xs text-zinc-400 mt-0.5">Real-time SSE events broadcast by AgentPay</p>
-                </div>
-
-                <button
-                  onClick={() => setEvents([])}
-                  className="text-[11px] font-mono text-zinc-400 hover:text-zinc-200"
-                >
-                  Clear Feed
-                </button>
-              </div>
-
-              <div ref={feedRef} className="mt-3 flex-1 overflow-y-auto space-y-2 max-h-[440px] pr-1">
-                {events.length === 0 ? (
-                  <div className="text-center py-24 text-xs font-mono text-zinc-500">
-                    No stream events yet. Click "Execute Real Payment" or query /api/data.
-                  </div>
-                ) : (
-                  events.map((e) => (
-                    <div
-                      key={e.id}
-                      className={`p-3 rounded border text-xs font-mono ${
-                        e.type === 'payment_verified'
-                          ? 'border-emerald-900/80 bg-emerald-950/20 text-emerald-300'
-                          : 'border-zinc-800 bg-zinc-950 text-zinc-300'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="font-semibold text-white">{e.title}</span>
-                        <span className="text-[10px] text-zinc-500">{e.time}</span>
-                      </div>
-                      <div className="text-[11px] text-zinc-400 mt-0.5">{e.detail}</div>
-                      {e.hash && (
-                        <div className="mt-1.5 pt-1.5 border-t border-zinc-800/60 flex items-center justify-between text-[10px] text-zinc-500">
-                          <span>hash: {e.hash.slice(0, 22)}...</span>
-                          <button
-                            onClick={() => copyToClipboard(e.hash, e.id)}
-                            className="text-zinc-400 hover:text-zinc-200"
-                          >
-                            {copied === e.id ? 'Copied' : 'Copy Hash'}
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  ))
-                )}
-              </div>
-            </section>
-
-          </div>
-
-          {/* Voltage Node Wallet Activity & Live Ledger Outflows */}
+          {/* Connected Autonomous Wallet Activity & Live Ledger */}
           <section className="bg-zinc-900/60 border border-zinc-800 rounded-lg p-5 space-y-4">
-            <div className="flex items-center justify-between pb-3 border-b border-zinc-800/80">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-zinc-800/80 gap-3">
               <div>
                 <div className="flex items-center gap-2">
-                  <h2 className="text-sm font-semibold text-white">Voltage Node Wallet Activity (Live Ledger)</h2>
-                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700">
-                    Mutinynet Signet
+                  <h2 className="text-sm font-semibold text-white">Connected Wallet Activity (Live Ledger)</h2>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700 font-semibold">
+                    {activeKey?.walletType === 'nwc'
+                      ? 'Nostr Wallet Connect (NWC)'
+                      : activeKey?.walletType === 'lnd'
+                      ? 'Custom LND Node'
+                      : 'Voltage Cloud (Mutinynet)'}
                   </span>
                 </div>
                 <p className="text-xs text-zinc-400 mt-0.5">
-                  Live payments recorded by Voltage API for wallet <span className="font-mono text-zinc-300">{walletId ? `${walletId.slice(0, 20)}...` : 'Connected Wallet'}</span>
+                  Live on-chain and Lightning transactions recorded for <span className="font-mono text-zinc-200">{activeKey?.agentName || 'Active Agent'}</span>
                 </p>
               </div>
 
-              <button
-                onClick={fetchWalletHistory}
-                disabled={isLoadingHistory}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 transition"
-              >
-                <RefreshCw className={`h-3 w-3 ${isLoadingHistory ? 'animate-spin' : ''}`} />
-                <span>{isLoadingHistory ? 'Refreshing...' : 'Refresh Ledger'}</span>
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={async () => {
+                    await fetchWalletHistory();
+                    if (user) await loadUserAgents(user);
+                  }}
+                  disabled={isLoadingHistory}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-mono border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 transition"
+                >
+                  <RefreshCw className={`h-3 w-3 ${isLoadingHistory ? 'animate-spin text-amber-400' : ''}`} />
+                  <span>{isLoadingHistory ? 'Refreshing...' : 'Refresh Ledger'}</span>
+                </button>
+              </div>
             </div>
 
+            {/* If user has multiple registered agents, allow switching right here on the ledger */}
+            {keyList.length > 1 && (
+              <div className="flex items-center gap-2 overflow-x-auto pb-1 text-xs font-mono">
+                <span className="text-[11px] text-zinc-500 uppercase shrink-0">Filter Agent:</span>
+                {keyList.map((k) => (
+                  <button
+                    key={k.id}
+                    onClick={() => setActiveKey(k)}
+                    className={`px-2.5 py-1 rounded text-xs transition shrink-0 ${
+                      activeKey?.id === k.id
+                        ? 'bg-zinc-800 text-white font-medium border border-zinc-600'
+                        : 'bg-zinc-950 text-zinc-400 hover:text-zinc-200 border border-zinc-850'
+                    }`}
+                  >
+                    {k.agentName} ({k.walletType})
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Ledger Transactions */}
             {walletHistory.length === 0 ? (
-              <div className="text-center py-8 text-xs font-mono text-zinc-500">
-                Loading wallet activity from Voltage...
+              <div className="py-12 text-center space-y-3 bg-zinc-950/60 rounded border border-zinc-800/80 p-6">
+                <div className="h-10 w-10 rounded-full bg-zinc-900 border border-zinc-800 mx-auto flex items-center justify-center text-zinc-400">
+                  <Zap className="h-5 w-5 text-amber-400" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-white">No Ledger Transactions Yet</h3>
+                  <p className="text-xs text-zinc-400 mt-1 max-w-md mx-auto">
+                    Transactions executed autonomously by your AI agent using <code className="text-zinc-300">pay_lightning_invoice</code> or <code className="text-zinc-300">fetch_with_l402</code> will appear here automatically.
+                  </p>
+                </div>
               </div>
             ) : (
               <div className="space-y-2">
                 {walletHistory.map((item) => (
                   <div
                     key={item.id}
-                    className="p-3 rounded bg-zinc-950 border border-zinc-800 flex flex-col md:flex-row md:items-center justify-between gap-2 text-xs font-mono"
+                    className="p-3.5 rounded bg-zinc-950 border border-zinc-800 flex flex-col md:flex-row md:items-center justify-between gap-2.5 text-xs font-mono hover:border-zinc-700 transition"
                   >
                     <div className="flex items-center gap-2.5">
                       <span
@@ -1515,31 +1537,40 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                       </span>
                       <div>
                         <div className="font-medium text-zinc-200 flex items-center gap-2">
-                          <span>{item.amountSats} SATS</span>
-                          <span className="text-zinc-500 text-[11px] font-normal">({item.memo})</span>
+                          <span className="font-semibold text-white">{item.amountSats} SATS</span>
+                          <span className="text-zinc-400 text-[11px] font-normal">({item.memo})</span>
                         </div>
-                        <div className="text-[10px] text-zinc-500 mt-0.5">
-                          ID: {item.id.slice(0, 24)}...
-                          {item.ledgerId && ` • Ledger: ${item.ledgerId.slice(0, 16)}...`}
+                        <div className="text-[10px] text-zinc-500 mt-0.5 flex flex-wrap items-center gap-2">
+                          <span>ID: {item.id.slice(0, 24)}...</span>
+                          {item.ledgerId && <span>• Ledger: {item.ledgerId.slice(0, 16)}...</span>}
+                          {item.preimage && <span>• Preimage: {item.preimage.slice(0, 16)}...</span>}
                         </div>
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-3 text-[11px] text-zinc-400 justify-between md:justify-end">
+                    <div className="flex items-center gap-3 text-[11px] text-zinc-400 justify-between md:justify-end shrink-0">
                       <span
-                        className={`px-1.5 py-0.5 rounded text-[10px] capitalize ${
+                        className={`px-1.5 py-0.5 rounded text-[10px] capitalize font-medium ${
                           item.status === 'completed'
-                            ? 'text-emerald-400 bg-emerald-950/40'
+                            ? 'text-emerald-400 bg-emerald-950/60 border border-emerald-800/50'
                             : item.status === 'failed'
-                            ? 'text-red-400 bg-red-950/40'
-                            : 'text-zinc-400 bg-zinc-800/60'
+                            ? 'text-red-400 bg-red-950/60 border border-red-800/50'
+                            : 'text-zinc-400 bg-zinc-800/60 border border-zinc-700'
                         }`}
                       >
                         {item.status}
                       </span>
                       <span className="text-[10px] text-zinc-500">
-                        {new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                        {item.createdAt ? new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Just now'}
                       </span>
+                      {item.preimage && (
+                        <button
+                          onClick={() => copyToClipboard(item.preimage, item.id)}
+                          className="text-[10px] px-2 py-0.5 rounded bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-zinc-300 transition"
+                        >
+                          {copied === item.id ? 'Copied' : 'Copy Receipt'}
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}
