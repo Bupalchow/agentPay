@@ -498,7 +498,8 @@ export default function App() {
     setIsTestingEndpoint(true);
     setQuickTestResult(null);
 
-    const merchantUrl = 'http://localhost:3001/api/data';
+    const merchantBase = import.meta.env.VITE_MERCHANT_BASE_URL || 'http://localhost:3001';
+    const merchantUrl = `${merchantBase.replace(/\/$/, '')}/api/data`;
     try {
       const res = await fetch(merchantUrl);
       const authHeader = res.headers.get('WWW-Authenticate') || '';
@@ -506,14 +507,14 @@ export default function App() {
       setQuickTestResult({
         status: res.status,
         message: res.status === 402 
-          ? 'Merchant Server (:3001) correctly returned HTTP 402 with BOLT11 invoice and macaroon.' 
+          ? `Merchant Server (${merchantBase}) correctly returned HTTP 402 with BOLT11 invoice and macaroon.` 
           : 'Unexpected status code received from merchant.',
         authHeaderPreview: authHeader ? authHeader.slice(0, 70) + '...' : 'none'
       });
     } catch (err) {
       setQuickTestResult({
         status: 0,
-        message: `Could not connect to Merchant Server at ${merchantUrl}. Ensure 'node merchant.js' is running on port 3001.`
+        message: `Could not connect to Merchant Server at ${merchantUrl}. Ensure the merchant server is running.`
       });
     } finally {
       setIsTestingEndpoint(false);
