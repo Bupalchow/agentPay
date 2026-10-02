@@ -14,6 +14,30 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
+// ── Root Health & Status (Keeps Cloud Instances Awake) ──
+app.get(['/', '/health'], (req, res) => {
+    res.json({
+        status: "ok",
+        service: "AgentPay Gateway & Remote MCP Server",
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString()
+    });
+});
+
+// ── Auto Keep-Alive (Prevents Render Free Tier Cold Starts) ──
+const pingTargetUrl = process.env.RENDER_EXTERNAL_URL || process.env.SERVER_URL;
+if (pingTargetUrl) {
+    console.log(`[Keep-Alive] Heartbeat active for ${pingTargetUrl} (pinging every 10 mins)`);
+    setInterval(async () => {
+        try {
+            await axios.get(`${pingTargetUrl.replace(/\/$/, '')}/health`, { timeout: 10000 });
+            console.log(`[Keep-Alive] Self-ping successful at ${new Date().toLocaleTimeString()}`);
+        } catch (err) {
+            console.warn(`[Keep-Alive] Ping warning: ${err.message}`);
+        }
+    }, 10 * 60 * 1000); // Every 10 mins (Render sleeps after 15 mins)
+}
+
 // ── Server-Sent Events (SSE) for Mission Control Dashboard ──
 let clients = [];
 
