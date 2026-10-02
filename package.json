@@ -1,14 +1,11 @@
 {
   "name": "agentpay",
   "version": "1.0.0",
-  "main": "index.js",
-  "bin": {
-    "agentpay": "./mcp.js"
-  },
+  "main": "server/index.js",
   "scripts": {
-    "start": "node index.js",
-    "gateway": "node index.js",
+    "start": "node server/index.js",
     "merchant": "node merchant/index.js",
+    "dashboard": "npm run dev --prefix dashboard",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

@@ -1,4 +1,8 @@
-/.agents
-/.env
-/node_modules
+.agents
+.env
+.env.local
+*.env
 serviceAccountKey.json
+node_modules
+dist
+.DS_Store

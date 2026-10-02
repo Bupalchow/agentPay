@@ -193,18 +193,45 @@ const { getAuth } = require('firebase-admin/auth');
 const { getFirestore } = require('firebase-admin/firestore');
 
 if (!admin.getApps().length) {
-    const serviceAccountPath = path.join(__dirname, 'serviceAccountKey.json');
-    if (fs.existsSync(serviceAccountPath)) {
-        admin.initializeApp({
-            credential: cert(require(serviceAccountPath)),
-            projectId: process.env.FIREBASE_PROJECT_ID || 'proximity-51dec'
-        });
-        console.log('[Firebase] Initialized Admin SDK with serviceAccountKey.json (Firestore Cloud Connected)');
-    } else {
-        admin.initializeApp({
-            projectId: process.env.FIREBASE_PROJECT_ID || 'proximity-51dec'
-        });
-        console.log('[Firebase] Initialized with default project config');
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        try {
+            let raw = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+            // Handle if base64 encoded or double-quoted
+            if (!raw.startsWith('{')) {
+                try {
+                    const decoded = Buffer.from(raw, 'base64').toString('utf8');
+                    if (decoded.includes('"type"')) raw = decoded;
+                } catch (e) {}
+            }
+            const serviceAccount = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            admin.initializeApp({
+                credential: cert(serviceAccount),
+                projectId: process.env.FIREBASE_PROJECT_ID || serviceAccount.project_id || 'proximity-51dec'
+            });
+            console.log('[Firebase] Initialized Admin SDK with FIREBASE_SERVICE_ACCOUNT env variable');
+        } catch (parseErr) {
+            console.error('[Firebase] Failed to parse FIREBASE_SERVICE_ACCOUNT env:', parseErr.message);
+        }
+    }
+
+    if (!admin.getApps().length) {
+        const localPaths = [
+            path.join(__dirname, 'serviceAccountKey.json'),
+            path.join(__dirname, '..', 'serviceAccountKey.json')
+        ];
+        const foundPath = localPaths.find(p => fs.existsSync(p));
+        if (foundPath) {
+            admin.initializeApp({
+                credential: cert(require(foundPath)),
+                projectId: process.env.FIREBASE_PROJECT_ID || 'proximity-51dec'
+            });
+            console.log(`[Firebase] Initialized Admin SDK with ${path.basename(foundPath)} (Firestore Cloud Connected)`);
+        } else {
+            admin.initializeApp({
+                projectId: process.env.FIREBASE_PROJECT_ID || 'proximity-51dec'
+            });
+            console.log('[Firebase] Initialized with default project config');
+        }
     }
 }
 
@@ -344,17 +371,10 @@ app.post('/api/keys', verifyFirebaseAuth, async (req, res) => {
             success: true,
             key: newKey,
             mcpConfig: {
-                remote: {
+                sse: {
+                    serverUrl: `http://localhost:${PORT}/sse?key=${serviceKey}`,
                     url: `http://localhost:${PORT}/sse`,
                     headers: { Authorization: `Bearer ${serviceKey}` }
-                },
-                stdio: {
-                    command: "node",
-                    args: ["./mcp.js"],
-                    env: {
-                        AGENTPAY_SERVICE_KEY: serviceKey,
-                        AGENTPAY_GATEWAY_URL: `http://localhost:${PORT}`
-                    }
                 }
             }
         });
