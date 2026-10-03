@@ -1,16 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Play, Check, Copy, RefreshCw, Circle, ArrowRight, 
+import {
+  Play, Check, Copy, RefreshCw, Circle, ArrowRight,
   User, LogOut, Lock, Key, AlertCircle, Shield, Zap, Trash2,
   Sliders, RotateCcw
 } from 'lucide-react';
-import { 
-  auth, 
+import {
+  auth,
   db,
-  isConfigured as isFirebaseConfigured, 
-  signInWithEmailAndPassword, 
-  createUserWithEmailAndPassword, 
-  signOut, 
+  isConfigured as isFirebaseConfigured,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signOut,
   onAuthStateChanged,
   collection,
   doc,
@@ -42,7 +42,7 @@ export default function App() {
   const [mcpClient, setMcpClient] = useState('antigravity'); // 'antigravity' | 'claude' | 'python' | 'curl'
   const [walletType, setWalletType] = useState('voltage'); // 'voltage' | 'nwc' | 'lnd'
   const [newKeyName, setNewKeyName] = useState('');
-  
+
   // Wallet Credentials Form States
   const [voltageApiKey, setVoltageApiKey] = useState('');
   const [voltageOrgId, setVoltageOrgId] = useState('');
@@ -312,7 +312,7 @@ export default function App() {
   // ── Handle Logout ──
   const handleLogout = async () => {
     if (auth) {
-      try { await signOut(auth); } catch (e) {}
+      try { await signOut(auth); } catch (e) { }
     }
     setUser(null);
     setKeyList([]);
@@ -344,13 +344,13 @@ export default function App() {
       const parsedLimit = Number(spendLimit) >= 0 ? Number(spendLimit) : 500;
       const res = await fetch(`${API_BASE}/api/keys`, {
         method: 'POST',
-        headers: { 
+        headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${idToken}`
         },
-        body: JSON.stringify({ 
-          agentName: newKeyName, 
-          walletType, 
+        body: JSON.stringify({
+          agentName: newKeyName,
+          walletType,
           walletConfig,
           spendLimit: parsedLimit
         })
@@ -415,13 +415,13 @@ export default function App() {
       const idToken = await user.getIdToken();
       const res = await fetch(`${API_BASE}/api/keys/${agentId}`, {
         method: 'PATCH',
-        headers: { 
+        headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${idToken}`
         },
-        body: JSON.stringify({ 
-          spendLimit: validLimit, 
-          resetSpent 
+        body: JSON.stringify({
+          spendLimit: validLimit,
+          resetSpent
         })
       });
 
@@ -430,7 +430,7 @@ export default function App() {
         // Sync to Firestore
         if (db) {
           try {
-            const updates = { 
+            const updates = {
               spendLimit: validLimit,
               ...(resetSpent ? { totalSpentSats: 0 } : {})
             };
@@ -475,7 +475,7 @@ export default function App() {
         if (db) {
           try {
             await deleteDoc(doc(db, "users", user.uid, "agents", agentToDelete.id));
-          } catch (e) {}
+          } catch (e) { }
         }
         const updatedList = keyList.filter((k) => k.id !== agentToDelete.id);
         setKeyList(updatedList);
@@ -560,7 +560,7 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
       <div className="min-h-screen bg-[#090a0c] text-zinc-400 flex items-center justify-center font-mono text-xs">
         <div className="flex items-center gap-2">
           <RefreshCw className="h-4 w-4 animate-spin text-zinc-300" />
-          <span>Authenticating Developer Session...</span>
+          <span>Authenticating Session...</span>
         </div>
       </div>
     );
@@ -573,15 +573,11 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
     return (
       <div className="min-h-screen bg-[#090a0c] text-zinc-200 font-sans flex flex-col justify-center items-center p-4">
         <div className="w-full max-w-sm space-y-6">
-          
+
           <div className="text-center space-y-1.5">
-            <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-[11px] font-mono text-zinc-400">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-              <span>Production L402 Gateway</span>
-            </div>
             <h1 className="text-xl font-bold tracking-tight text-white">AgentPay Console</h1>
             <p className="text-xs text-zinc-400">
-              Sign in with your developer account to manage autonomous agent wallets and keys.
+              Sign in with your account to manage autonomous agent wallets and keys.
             </p>
           </div>
 
@@ -591,18 +587,16 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
               <button
                 type="button"
                 onClick={() => { setAuthMode('signin'); setAuthError(''); }}
-                className={`flex-1 py-1.5 rounded transition ${
-                  authMode === 'signin' ? 'bg-zinc-800 text-white font-semibold' : 'text-zinc-400 hover:text-zinc-200'
-                }`}
+                className={`flex-1 py-1.5 rounded transition ${authMode === 'signin' ? 'bg-zinc-800 text-white font-semibold' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
               >
                 Sign In
               </button>
               <button
                 type="button"
                 onClick={() => { setAuthMode('signup'); setAuthError(''); }}
-                className={`flex-1 py-1.5 rounded transition ${
-                  authMode === 'signup' ? 'bg-zinc-800 text-white font-semibold' : 'text-zinc-400 hover:text-zinc-200'
-                }`}
+                className={`flex-1 py-1.5 rounded transition ${authMode === 'signup' ? 'bg-zinc-800 text-white font-semibold' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
               >
                 Create Account
               </button>
@@ -617,11 +611,11 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
 
             <form onSubmit={handleAuthSubmit} className="space-y-3.5">
               <div>
-                <label className="block text-[11px] font-mono text-zinc-400 mb-1">Developer Email</label>
+                <label className="block text-[11px] font-mono text-zinc-400 mb-1">Email</label>
                 <input
                   type="email"
                   required
-                  placeholder="developer@example.com"
+                  placeholder="user@example.com"
                   value={authEmail}
                   onChange={(e) => setAuthEmail(e.target.value)}
                   className="w-full bg-zinc-950 border border-zinc-700 rounded px-3 py-2 text-xs text-zinc-100 focus:outline-none focus:border-zinc-500 font-mono"
@@ -651,33 +645,28 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                     <span>Authenticating...</span>
                   </>
                 ) : (
-                  <span>{authMode === 'signin' ? 'Sign In to Console' : 'Create Developer Account'}</span>
+                  <span>{authMode === 'signin' ? 'Sign In to Console' : 'Create Account'}</span>
                 )}
               </button>
             </form>
           </div>
-
-          <div className="text-center text-[11px] font-mono text-zinc-500">
-            Protected by Firebase Auth & Firestore
-          </div>
-
         </div>
       </div>
     );
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 3. PROTECTED DEVELOPER DASHBOARD (Rendered ONLY when logged in)
+  // 3. PROTECTED DASHBOARD (Rendered ONLY when logged in)
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   return (
     <div className="min-h-screen bg-[#090a0c] text-zinc-200 font-sans p-4 sm:p-6 lg:p-8 max-w-5xl mx-auto space-y-6">
-      
+
       {/* ── Top Bar: Authenticated Header ── */}
       <header className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-zinc-800/80 gap-3">
         <div className="flex items-center gap-3">
           <span className="font-semibold text-white tracking-tight text-base">AgentPay</span>
           <span className="text-zinc-600 font-mono text-xs">/</span>
-          <span className="text-xs text-zinc-400 font-mono">Developer Console</span>
+          <span className="text-xs text-zinc-400 font-mono">Console</span>
         </div>
 
         <div className="flex items-center gap-3">
@@ -685,21 +674,19 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
           <nav className="flex items-center bg-zinc-900 border border-zinc-800 rounded p-1 text-xs font-medium">
             <button
               onClick={() => setCurrentPage('integration')}
-              className={`px-3 py-1.5 rounded transition ${
-                currentPage === 'integration'
-                  ? 'bg-zinc-700 text-white font-semibold'
-                  : 'text-zinc-400 hover:text-zinc-200'
-              }`}
+              className={`px-3 py-1.5 rounded transition ${currentPage === 'integration'
+                ? 'bg-zinc-700 text-white font-semibold'
+                : 'text-zinc-400 hover:text-zinc-200'
+                }`}
             >
               Integration
             </button>
             <button
               onClick={() => setCurrentPage('activity')}
-              className={`px-3 py-1.5 rounded transition ${
-                currentPage === 'activity'
-                  ? 'bg-zinc-700 text-white font-semibold'
-                  : 'text-zinc-400 hover:text-zinc-200'
-              }`}
+              className={`px-3 py-1.5 rounded transition ${currentPage === 'activity'
+                ? 'bg-zinc-700 text-white font-semibold'
+                : 'text-zinc-400 hover:text-zinc-200'
+                }`}
             >
               Live Activity
             </button>
@@ -721,9 +708,8 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
           {/* SSE Connection Status */}
           <div className="flex items-center gap-2 text-xs font-mono px-2.5 py-1.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-400">
             <span
-              className={`h-2 w-2 rounded-full ${
-                connectionStatus === 'connected' ? 'bg-emerald-500' : 'bg-red-500'
-              }`}
+              className={`h-2 w-2 rounded-full ${connectionStatus === 'connected' ? 'bg-emerald-500' : 'bg-red-500'
+                }`}
             />
             <span className="hidden sm:inline">
               {connectionStatus === 'connected' ? 'Live' : 'Offline'}
@@ -760,7 +746,7 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
             {isCreatingKey && (
               <form onSubmit={handleCreateKey} className="p-4 rounded bg-zinc-950 border border-zinc-800 space-y-3">
                 <div className="text-xs font-semibold text-white">Register Autonomous Agent Wallet</div>
-                
+
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div className="sm:col-span-2">
                     <label className="block text-[11px] font-mono text-zinc-400 mb-1">Agent Identifier Name</label>
@@ -898,7 +884,7 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                       Gateway blocks payments (HTTP 403) when budget is exceeded
                     </span>
                   </div>
-                  
+
                   <div className="flex flex-wrap items-center gap-2">
                     <input
                       type="number"
@@ -925,11 +911,10 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                           key={preset.val}
                           type="button"
                           onClick={() => setSpendLimit(preset.val)}
-                          className={`px-2 py-1 rounded border transition ${
-                            Number(spendLimit) === preset.val
-                              ? 'bg-amber-400 text-black border-amber-300 font-semibold'
-                              : 'bg-zinc-950 border-zinc-700 text-zinc-300 hover:bg-zinc-800'
-                          }`}
+                          className={`px-2 py-1 rounded border transition ${Number(spendLimit) === preset.val
+                            ? 'bg-amber-400 text-black border-amber-300 font-semibold'
+                            : 'bg-zinc-950 border-zinc-700 text-zinc-300 hover:bg-zinc-800'
+                            }`}
                         >
                           {preset.label}
                         </button>
@@ -1028,18 +1013,17 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                     <div className="flex items-center gap-2">
                       <Sliders className="h-3.5 w-3.5 text-amber-400" />
                       <span className="text-xs font-semibold text-white">Autonomous Spend Limit</span>
-                      <span className={`text-[10px] font-mono px-2 py-0.5 rounded font-medium border ${
-                        activeKey?.spendLimit > 0 && (activeKey?.totalSpentSats || 0) >= activeKey?.spendLimit
-                          ? 'bg-red-950/80 text-red-400 border-red-800/60'
-                          : activeKey?.spendLimit > 0
+                      <span className={`text-[10px] font-mono px-2 py-0.5 rounded font-medium border ${activeKey?.spendLimit > 0 && (activeKey?.totalSpentSats || 0) >= activeKey?.spendLimit
+                        ? 'bg-red-950/80 text-red-400 border-red-800/60'
+                        : activeKey?.spendLimit > 0
                           ? 'bg-emerald-950/80 text-emerald-400 border-emerald-800/60'
                           : 'bg-zinc-900 text-zinc-400 border-zinc-700'
-                      }`}>
+                        }`}>
                         {activeKey?.spendLimit > 0 && (activeKey?.totalSpentSats || 0) >= activeKey?.spendLimit
                           ? 'LIMIT REACHED (PAYMENTS BLOCKED)'
                           : activeKey?.spendLimit > 0
-                          ? 'BUDGET ACTIVE'
-                          : 'UNLIMITED SPEND'}
+                            ? 'BUDGET ACTIVE'
+                            : 'UNLIMITED SPEND'}
                       </span>
                     </div>
 
@@ -1108,11 +1092,10 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                               key={preset}
                               type="button"
                               onClick={() => setEditLimitInput(preset)}
-                              className={`px-2 py-0.5 rounded border transition ${
-                                Number(editLimitInput) === preset
-                                  ? 'bg-amber-400 text-black border-amber-300 font-semibold'
-                                  : 'bg-zinc-950 hover:bg-zinc-800 border-zinc-700 text-zinc-300'
-                              }`}
+                              className={`px-2 py-0.5 rounded border transition ${Number(editLimitInput) === preset
+                                ? 'bg-amber-400 text-black border-amber-300 font-semibold'
+                                : 'bg-zinc-950 hover:bg-zinc-800 border-zinc-700 text-zinc-300'
+                                }`}
                             >
                               {preset === 0 ? 'Unlimited' : `${preset.toLocaleString()} sats`}
                             </button>
@@ -1164,13 +1147,12 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                     {activeKey?.spendLimit > 0 && (
                       <div className="w-full h-2 rounded-full bg-zinc-900 border border-zinc-800 overflow-hidden">
                         <div
-                          className={`h-full transition-all duration-500 ${
-                            (activeKey?.totalSpentSats || 0) >= activeKey?.spendLimit
-                              ? 'bg-red-500'
-                              : ((activeKey?.totalSpentSats || 0) / activeKey?.spendLimit) >= 0.75
+                          className={`h-full transition-all duration-500 ${(activeKey?.totalSpentSats || 0) >= activeKey?.spendLimit
+                            ? 'bg-red-500'
+                            : ((activeKey?.totalSpentSats || 0) / activeKey?.spendLimit) >= 0.75
                               ? 'bg-amber-400'
                               : 'bg-emerald-500'
-                          }`}
+                            }`}
                           style={{
                             width: `${Math.min(100, Math.round(((activeKey?.totalSpentSats || 0) / activeKey?.spendLimit) * 100))}%`
                           }}
@@ -1188,11 +1170,10 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                       {keyList.map((k) => (
                         <div
                           key={k.id}
-                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-mono border transition ${
-                            activeKey?.id === k.id
-                              ? 'border-zinc-500 bg-zinc-800 text-white font-medium'
-                              : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-zinc-200'
-                          }`}
+                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-mono border transition ${activeKey?.id === k.id
+                            ? 'border-zinc-500 bg-zinc-800 text-white font-medium'
+                            : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-zinc-200'
+                            }`}
                         >
                           <button
                             onClick={() => {
@@ -1203,11 +1184,10 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                           >
                             <span>{k.agentName}</span>
                             <span className="text-[10px] text-zinc-500">({k.walletType})</span>
-                            <span className={`text-[10px] px-1 py-0.2 rounded font-mono ${
-                              k.spendLimit > 0 && (k.totalSpentSats || 0) >= k.spendLimit
-                                ? 'bg-red-950 text-red-400'
-                                : 'bg-zinc-900 text-zinc-400'
-                            }`}>
+                            <span className={`text-[10px] px-1 py-0.2 rounded font-mono ${k.spendLimit > 0 && (k.totalSpentSats || 0) >= k.spendLimit
+                              ? 'bg-red-950 text-red-400'
+                              : 'bg-zinc-900 text-zinc-400'
+                              }`}>
                               {(k.totalSpentSats || 0)}/{k.spendLimit > 0 ? k.spendLimit : '∞'}
                             </span>
                           </button>
@@ -1236,8 +1216,8 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
               <div>
                 <h2 className="text-sm font-semibold text-white">Agent MCP Configuration</h2>
                 <p className="text-xs text-zinc-400 mt-0.5">
-                  {activeKey 
-                    ? `Pre-populated with active key for ${activeKey.agentName}.` 
+                  {activeKey
+                    ? `Pre-populated with active key for ${activeKey.agentName}.`
                     : 'Register an agent wallet above to populate configuration.'}
                 </p>
               </div>
@@ -1252,11 +1232,10 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                   <button
                     key={item.id}
                     onClick={() => setMcpClient(item.id)}
-                    className={`px-3 py-1.5 rounded transition ${
-                      mcpClient === item.id
-                        ? 'bg-zinc-800 text-white font-medium'
-                        : 'text-zinc-400 hover:text-zinc-200'
-                    }`}
+                    className={`px-3 py-1.5 rounded transition ${mcpClient === item.id
+                      ? 'bg-zinc-800 text-white font-medium'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
                   >
                     {item.label}
                   </button>
@@ -1272,11 +1251,10 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
               <button
                 onClick={() => copyToClipboard(getSnippet(), 'snippet')}
                 disabled={!activeKey}
-                className={`absolute top-3 right-3 px-2.5 py-1 rounded text-xs font-mono transition flex items-center gap-1.5 ${
-                  activeKey 
-                    ? 'bg-zinc-800 hover:bg-zinc-700 text-zinc-200' 
-                    : 'bg-zinc-900 text-zinc-600 cursor-not-allowed'
-                }`}
+                className={`absolute top-3 right-3 px-2.5 py-1 rounded text-xs font-mono transition flex items-center gap-1.5 ${activeKey
+                  ? 'bg-zinc-800 hover:bg-zinc-700 text-zinc-200'
+                  : 'bg-zinc-900 text-zinc-600 cursor-not-allowed'
+                  }`}
               >
                 {copied === 'snippet' ? (
                   <>
@@ -1384,8 +1362,8 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                     {activeKey?.walletType === 'nwc'
                       ? 'Nostr Wallet Connect (NWC)'
                       : activeKey?.walletType === 'lnd'
-                      ? 'Custom LND Node'
-                      : 'Voltage Cloud (Mutinynet)'}
+                        ? 'Custom LND Node'
+                        : 'Voltage Cloud (Mutinynet)'}
                   </span>
                 </div>
                 <p className="text-xs text-zinc-400 mt-0.5">
@@ -1416,11 +1394,10 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                   <button
                     key={k.id}
                     onClick={() => setActiveKey(k)}
-                    className={`px-2.5 py-1 rounded text-xs transition shrink-0 ${
-                      activeKey?.id === k.id
-                        ? 'bg-zinc-800 text-white font-medium border border-zinc-600'
-                        : 'bg-zinc-950 text-zinc-400 hover:text-zinc-200 border border-zinc-850'
-                    }`}
+                    className={`px-2.5 py-1 rounded text-xs transition shrink-0 ${activeKey?.id === k.id
+                      ? 'bg-zinc-800 text-white font-medium border border-zinc-600'
+                      : 'bg-zinc-950 text-zinc-400 hover:text-zinc-200 border border-zinc-850'
+                      }`}
                   >
                     {k.agentName} ({k.walletType})
                   </button>
@@ -1450,11 +1427,10 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
                   >
                     <div className="flex items-center gap-2.5">
                       <span
-                        className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
-                          item.direction === 'send'
-                            ? 'bg-amber-950/60 text-amber-300 border border-amber-800/60'
-                            : 'bg-emerald-950/60 text-emerald-300 border border-emerald-800/60'
-                        }`}
+                        className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${item.direction === 'send'
+                          ? 'bg-amber-950/60 text-amber-300 border border-amber-800/60'
+                          : 'bg-emerald-950/60 text-emerald-300 border border-emerald-800/60'
+                          }`}
                       >
                         {item.direction === 'send' ? '- OUTFLOW' : '+ INFLOW'}
                       </span>
@@ -1473,13 +1449,12 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
 
                     <div className="flex items-center gap-3 text-[11px] text-zinc-400 justify-between md:justify-end shrink-0">
                       <span
-                        className={`px-1.5 py-0.5 rounded text-[10px] capitalize font-medium ${
-                          item.status === 'completed'
-                            ? 'text-emerald-400 bg-emerald-950/60 border border-emerald-800/50'
-                            : item.status === 'failed'
+                        className={`px-1.5 py-0.5 rounded text-[10px] capitalize font-medium ${item.status === 'completed'
+                          ? 'text-emerald-400 bg-emerald-950/60 border border-emerald-800/50'
+                          : item.status === 'failed'
                             ? 'text-red-400 bg-red-950/60 border border-red-800/50'
                             : 'text-zinc-400 bg-zinc-800/60 border border-zinc-700'
-                        }`}
+                          }`}
                       >
                         {item.status}
                       </span>

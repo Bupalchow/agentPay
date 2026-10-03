@@ -44,7 +44,7 @@ npm start
 ```
 > The gateway server runs at `http://localhost:3000`. It exposes the REST API, SSE live event stream, and remote MCP server (`/sse`).
 
-### 3. Start the Developer Dashboard
+### 3. Start the Dashboard
 
 In a new terminal:
 ```bash

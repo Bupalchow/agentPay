@@ -7,7 +7,7 @@ This is an independent demo API server demonstrating **L402 (HTTP 402 Payment Re
 The merchant is deployed live on Vercel and available 24/7:
 **[https://merchant-peach.vercel.app](https://merchant-peach.vercel.app)**
 
-> 💡 **Note for Judges & Developers:** You do not need to run this service locally. You can test directly against the live URL above.
+> 💡 **Note:** You do not need to run this service locally. You can test directly against the live URL above.
 
 ---
 
