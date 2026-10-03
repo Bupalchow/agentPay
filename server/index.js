@@ -16,9 +16,16 @@ const PORT = process.env.PORT || 3000;
 
 // ── Root Health & Status (Keeps Cloud Instances Awake) ──
 app.get(['/', '/health'], (req, res) => {
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+    const host = req.get('host');
+    const baseUrl = `${proto}://${host}`;
+
     res.json({
-        status: "ok",
+        status: "online",
         service: "AgentPay Gateway & Remote MCP Server",
+        description: "Zero-trust autonomous payment gateway and Model Context Protocol (MCP) server for AI agents.",
+        mcpEndpoint: `${baseUrl}/sse`,
+        documentation: "Connect AI agents via MCP SSE with header 'Authorization: Bearer <agent_key>'",
         uptime: process.uptime(),
         timestamp: new Date().toISOString()
     });

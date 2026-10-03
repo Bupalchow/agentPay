@@ -141,15 +141,24 @@ async function createMerchantInvoice(amountSats, network = 'mutinynet') {
 
 // ── Root / Health ──
 app.get('/', (req, res) => {
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+    const host = req.get('host');
+    const baseUrl = `${proto}://${host}`;
+
     res.json({
-        service: "Independent Merchant API Server",
-        port: PORT,
+        service: "AgentPay L402 Merchant Service",
+        status: "online",
+        description: "Demo resource server protected by Bitcoin Lightning L402 paywalls.",
         endpoints: {
-            voltageDefaultPaywall: `http://localhost:${PORT}/api/data`,
-            nwcPaywall: `http://localhost:${PORT}/api/data/nwc`,
-            nwcInvoiceGenerator: `http://localhost:${PORT}/api/invoice/nwc`
+            voltagePaywall: `${baseUrl}/api/data`,
+            nwcPaywall: `${baseUrl}/api/data/nwc`,
+            invoiceGenerator: `${baseUrl}/api/invoice/nwc`
         },
-        receiverWallet: RECEIVER_WALLET_ID
+        l402Specification: {
+            protocol: "L402 (HTTP 402 Payment Required)",
+            pricePerQuery: "10 sats",
+            authHeaderFormat: "Authorization: L402 <macaroon>:<preimage>"
+        }
     });
 });
 

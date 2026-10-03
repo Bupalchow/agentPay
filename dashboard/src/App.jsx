@@ -61,8 +61,6 @@ export default function App() {
   const [activeKey, setActiveKey] = useState(null);
   const [isCreatingKey, setIsCreatingKey] = useState(false);
   const [isSavingKey, setIsSavingKey] = useState(false);
-  const [quickTestResult, setQuickTestResult] = useState(null);
-  const [isTestingEndpoint, setIsTestingEndpoint] = useState(false);
 
   // ── Live Activity Page State ──
   const [totalSats, setTotalSats] = useState(0);
@@ -493,33 +491,6 @@ export default function App() {
     }
   };
 
-  // ── Quick Test 402 Endpoint (Queries Independent Merchant on :3001) ──
-  const handleTestEndpoint = async () => {
-    setIsTestingEndpoint(true);
-    setQuickTestResult(null);
-
-    const merchantBase = import.meta.env.VITE_MERCHANT_BASE_URL || 'http://localhost:3001';
-    const merchantUrl = `${merchantBase.replace(/\/$/, '')}/api/data`;
-    try {
-      const res = await fetch(merchantUrl);
-      const authHeader = res.headers.get('WWW-Authenticate') || '';
-
-      setQuickTestResult({
-        status: res.status,
-        message: res.status === 402 
-          ? `Merchant Server (${merchantBase}) correctly returned HTTP 402 with BOLT11 invoice and macaroon.` 
-          : 'Unexpected status code received from merchant.',
-        authHeaderPreview: authHeader ? authHeader.slice(0, 70) + '...' : 'none'
-      });
-    } catch (err) {
-      setQuickTestResult({
-        status: 0,
-        message: `Could not connect to Merchant Server at ${merchantUrl}. Ensure the merchant server is running.`
-      });
-    } finally {
-      setIsTestingEndpoint(false);
-    }
-  };
 
   const currentKeyString = activeKey?.serviceKey || '<register-an-agent-to-generate-key>';
 
@@ -1354,55 +1325,6 @@ curl -X POST ${API_BASE}/api/gateway/pay \\
             </div>
           </section>
 
-          {/* Section 4: Live Paywall Verification */}
-          <section className="bg-zinc-900/60 border border-zinc-800 rounded-lg p-5 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-zinc-800/80 gap-3">
-              <div>
-                <h2 className="text-sm font-semibold text-white">Live Paywall Verification</h2>
-                <p className="text-xs text-zinc-400 mt-0.5">
-                  Verify that the proxy is actively issuing L402 challenges.
-                </p>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handleTestEndpoint}
-                  disabled={isTestingEndpoint}
-                  className="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-mono transition flex items-center gap-1.5"
-                >
-                  {isTestingEndpoint ? (
-                    <>
-                      <RefreshCw className="h-3 w-3 animate-spin" />
-                      <span>Testing...</span>
-                    </>
-                  ) : (
-                    <span>Test 402 Paywall</span>
-                  )}
-                </button>
-
-                <button
-                  onClick={() => setCurrentPage('activity')}
-                  className="px-3 py-1.5 rounded bg-white text-black hover:bg-zinc-200 text-xs font-medium transition flex items-center gap-1.5"
-                >
-                  <span>Go to Live Activity</span>
-                  <ArrowRight className="h-3 w-3" />
-                </button>
-              </div>
-            </div>
-
-            {quickTestResult && (
-              <div
-                className={`p-3 rounded border text-xs font-mono ${
-                  quickTestResult.status === 402
-                    ? 'border-emerald-800 bg-emerald-950/20 text-emerald-300'
-                    : 'border-red-800 bg-red-950/20 text-red-300'
-                }`}
-              >
-                <div className="font-semibold">Response: HTTP {quickTestResult.status} (Payment Required)</div>
-                <div className="text-[11px] text-zinc-400 mt-1">{quickTestResult.message}</div>
-              </div>
-            )}
-          </section>
 
         </main>
       )}
